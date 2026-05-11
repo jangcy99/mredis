@@ -43,7 +43,7 @@
 /* ─────────────────────────────────────────────────────────
  *  테스트 유틸
  * ───────────────────────────────────────────────────────── */
-#define SHM_TEST    "/shm_v5_test"
+#define SHM_TEST    SHM_DEFAULT_NAME
 #define PASS        "\033[32m[PASS]\033[0m"
 #define FAIL        "\033[31m[FAIL]\033[0m"
 #define SECT(t)     printf("\n\033[36m--- %s ---\033[0m\n", (t))
@@ -624,12 +624,136 @@ static void test_multiproc(void)
     shm_close(h);
 }
 
+#if 0
+/* ── 응답 타입 / 값 검사 헬퍼 ───────────────────────────── */
+static int reply_is_ok(s_replyObject *r)
+    { return r && r->type == REPLY_STATUS && strcmp((char*)r->ptr,"OK")==0; }
+static int reply_is_int(s_replyObject *r, int64_t v)
+    { return r && r->type == REPLY_INTEGER && r->integer == v; }
+#if 0
+static int reply_is_str(s_replyObject *r, const char *s)
+    { return r && r->type == REPLY_STRING && strcmp((char*)r->ptr,s)==0; }
+#endif
+static int reply_is_nil(s_replyObject *r)
+    { return r && r->type == REPLY_NIL; }
+static int reply_is_err(s_replyObject *r)
+    { return r && r->type == REPLY_ERROR; }
+static int reply_arr_len(s_replyObject *r, size_t n)
+    { return r && r->type == REPLY_ARRAY && r->elements == n; }
+/* ARRAY 내 i 번째 원소가 문자열 s 인지 */
+static int reply_arr_elem_str(s_replyObject *r, size_t i, const char *s)
+    { return r && r->type==REPLY_ARRAY && i<r->elements
+             && r->element[i] && r->element[i]->type==REPLY_STRING
+             && strcmp((char*)r->element[i]->ptr, s)==0; }
+#endif
+static void test_mset_mget(ShmHandle *h)
+{
+    SECT("KV - MSET / MGET");
+    s_replyObject *r;
+
+    r = run(h, "MSET", "k1", "v1", "k2", "v2", "k3", "v3", NULL);
+    CHECK(is_ok(r), "MSET 성공");
+    reply_free(r);
+
+    r = run(h, "MGET", "k1", "k2", "k3", "ghost", NULL);
+    CHECK(is_arr(r, 4), "MGET 4개 키");
+    if (r && r->elements >= 4) {
+        CHECK(is_str(r->element[0], "v1"), "MGET k1");
+        CHECK(is_str(r->element[1], "v2"), "MGET k2");
+        CHECK(is_str(r->element[2], "v3"), "MGET k3");
+        CHECK(is_nil(r->element[3]), "MGET ghost → NIL");
+    }
+    reply_free(r);
+
+    run(h, "DEL", "k1", "k2", "k3", NULL);
+}
+
+/* ============================================================
+ *  21. Redis Set 명령어 테스트 (Robust)
+ * ============================================================ */
+static void test_set(ShmHandle *h)
+{
+    SECT("21. Redis Set 명령어 테스트");
+    s_replyObject *r;
+
+    /* SCREATE */
+    r = run(h, "SCREATE", "myset", NULL);
+    CHECK(is_ok(r), "SCREATE myset");
+    reply_free(r);
+
+    /* SADD */
+    r = run(h, "SADD", "myset", "apple", "banana", "cherry", "apple", NULL);
+    CHECK(is_int(r, 3), "SADD 3개 멤버 (중복 제외)");
+    reply_free(r);
+
+    r = run(h, "SCARD", "myset", NULL);
+    CHECK(is_int(r, 3), "SCARD == 3");
+    reply_free(r);
+
+    /* SISMEMBER */
+    r = run(h, "SISMEMBER", "myset", "banana", NULL);
+    CHECK(is_int(r, 1), "SISMEMBER banana");
+    reply_free(r);
+
+    /* SREM */
+    r = run(h, "SREM", "myset", "banana", "grape", NULL);
+    CHECK(is_int(r, 1), "SREM banana → 1");
+    reply_free(r);
+
+    r = run(h, "SCARD", "myset", NULL);
+    CHECK(is_int(r, 2), "SREM 후 SCARD == 2");
+    reply_free(r);
+
+    /* SPOP count=1 */
+    r = run(h, "SPOP", "myset", NULL);
+    CHECK(is_arr(r, 1) || r->type == REPLY_STRING, "SPOP 1개 반환");
+    reply_free(r);
+
+    r = run(h, "SCARD", "myset", NULL);
+    CHECK(is_int(r, 1), "SPOP 후 SCARD == 1");
+    reply_free(r);
+
+    /* SPOP count=2 (남은 멤버 1개) */
+    r = run(h, "SPOP", "myset", "2", NULL);
+    CHECK(is_arr(r, 1), "SPOP count=2 → 실제 1개만 반환");
+    reply_free(r);
+
+    r = run(h, "SCARD", "myset", NULL);
+    CHECK(is_int(r, 0), "SPOP 후 SCARD == 0");
+    reply_free(r);
+
+    /* SRANDMEMBER */
+    r = run(h, "SRANDMEMBER", "myset", NULL);           // count 없음
+    CHECK(r && (r->type == REPLY_STRING || r->type == REPLY_NIL),
+          "SRANDMEMBER (단일) 정상");
+    reply_free(r);
+
+    /* 재생성 후 SRANDMEMBER count 테스트 */
+    run(h, "SADD", "myset2", "x", "y", "z", NULL);
+    r = run(h, "SRANDMEMBER", "myset2", "2", NULL);
+    CHECK(is_arr(r, 2), "SRANDMEMBER count=2");
+    reply_free(r);
+
+    run(h, "SDROP", "myset", NULL);
+    run(h, "SDROP", "myset2", NULL);
+
+    printf(PASS " Set 명령어 전체 테스트 완료\n");
+}
+
 /* ─────────────────────────────────────────────────────────
  *  main
  * ───────────────────────────────────────────────────────── */
-int main(void)
+int main(int argc, char *argv[])
 {
-    printf("==========================================\n");
+	if (argc > 1 && argv[1][0] == 'v')	{
+		ShmHandle *h = shm_open_existing(SHM_TEST);
+		if (h) {
+			shm_dump_stats(h);
+			shm_close(h);
+		}
+		return 0;
+	}
+	printf("==========================================\n");
     printf("  SHM v5  –  s_replyObject 통합 테스트\n");
     printf("==========================================\n");
 
@@ -642,12 +766,12 @@ int main(void)
     test_kv_basic(h);
     test_kv_update(h);
     test_kv_notfound(h);
+    test_mset_mget(h);
     test_key_unique(h);
     test_zset_basic(h);
     test_zset_flags(h);
     test_zset_misc(h);
     test_zset_range(h);
-    shm_dump_stats(h);
     test_hash_basic(h);
     test_hash_getall(h);
     test_hash_incr(h);
@@ -658,6 +782,8 @@ int main(void)
     test_zdrop_recreate(h);
     test_cmd_table(h);
     test_reply_print(h);
+    test_set(h);
+
 
     shm_dump_stats(h);
     shm_close(h);
@@ -669,7 +795,7 @@ int main(void)
 		shm_dump_stats(h);
 		shm_close(h);
 	}
-    shm_destroy(SHM_TEST);
+//    shm_destroy(SHM_TEST);
 
     printf("\n==========================================\n");
     printf("  최종: PASS=\033[32m%d\033[0m  FAIL=\033[31m%d\033[0m\n",

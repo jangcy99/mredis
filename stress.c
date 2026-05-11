@@ -48,7 +48,7 @@ void stress_worker(const char *shm_name) {
     exit(0);
 }
 
-int main(int argc, char *argv[]) {
+int main(__attribute__((unused)) int argc, __attribute__((unused)) char *argv[]) {
     const char *shm_name = "/shm_stress_test";
     uint64_t shm_size = 1024 * 1024 * 1024; // 128MB
 	ShmHandle	*h;

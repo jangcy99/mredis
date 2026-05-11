@@ -113,6 +113,64 @@ s_replyObject *cmd_get(ShmHandle *h, string_t *args[], uint32_t argc)
     return r;
 }
 
+/* ============================================================
+ *  MSET  key1 value1 key2 value2 ...
+ * ============================================================ */
+s_replyObject *cmd_mset(ShmHandle *h, string_t *args[], uint32_t argc)
+{
+    if (argc < 3 || (argc - 1) % 2 != 0)
+        return reply_error(SHM_ERR_ARGC, "usage: MSET key1 value1 [key2 value2 ...]");
+
+    int64_t success = 0;
+
+    for (uint32_t i = 1; i + 1 < argc; i += 2) {
+        string_t *key_arg = args[i];
+        string_t *val_arg = args[i+1];
+
+        string_t *set_args[3] = {
+            &STR_LIT("SET"),
+            key_arg,
+            val_arg
+        };
+
+        s_replyObject *r = cmd_set(h, set_args, 3);
+        if (r && r->type == REPLY_STATUS) {
+            success++;
+        }
+        reply_free(r);
+    }
+
+    return reply_ok();   // Redis는 MSET 성공 시 "OK" 반환
+}
+
+/* ============================================================
+ *  MGET  key1 key2 key3 ...
+ *  반환: ARRAY [value1, value2, value3, ...] (없으면 NIL)
+ * ============================================================ */
+s_replyObject *cmd_mget(ShmHandle *h, string_t *args[], uint32_t argc)
+{
+    if (argc < 2)
+        return reply_error(SHM_ERR_ARGC, "usage: MGET key1 [key2 ...]");
+
+    s_replyObject *arr = reply_array(argc - 1);
+    if (!arr) return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+
+    for (uint32_t i = 1; i < argc; i++) {
+        string_t *get_args[2] = {
+            &STR_LIT("GET"),
+            args[i]
+        };
+
+        s_replyObject *r = cmd_get(h, get_args, 2);
+        if (!r) {
+            reply_array_append(arr, reply_nil());
+        } else {
+            reply_array_append(arr, r);   // 소유권 이전
+        }
+    }
+
+    return arr;
+}
 /* ── DEL ─────────────────────────────────────────────────────
  *  args: DEL key [key …]
  *  반환: INTEGER 삭제 수

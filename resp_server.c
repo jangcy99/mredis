@@ -17,7 +17,6 @@
 
 #include "shm_types.h"
 #include "shm_core.h"
-#include "cmd_pubsub.h"
 #include "cmd_dispatch.h"
 
 #define MAX_CLIENTS     1024
@@ -131,6 +130,12 @@ static void process_command(int client_fd, ShmHandle *h, char *buf, size_t len)
         goto cleanup;
     }
 
+#if 0
+	printf ("COMMAND:\n");
+    for (uint32_t i = 0; i < argc; i++) {
+		printf ("%.*s\n", args[i]->len, args[i]->ptr);
+    }
+#endif
     /* 실제 커맨드 실행 */
     s_replyObject *reply = cmd_dispatch(h, args, argc);
 

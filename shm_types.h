@@ -32,6 +32,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <errno.h>
 
 /* ============================================================
  *  컴파일 타임 파라미터
@@ -94,10 +95,11 @@
 #define ZRANGE_DESC 1
 
 /* NameEntry 타입 */
-#define ENTRY_KV    1u
-#define ENTRY_ZSET  2u
-#define ENTRY_HASH  3u
-
+#define ENTRY_KV     1u
+#define ENTRY_ZSET   2u
+#define ENTRY_HASH   3u
+#define ENTRY_ZHSET  4u
+#define ENTRY_SET    5u
 /* ============================================================
  *  string_t  –  길이 포함 바이트열
  * ============================================================ */
@@ -326,6 +328,20 @@ typedef struct {
     pthread_mutex_t mutex;
 } ZSetHeader;
 
+typedef struct	{
+	uint64_t	next;
+	uint64_t	str_offset;
+	uint32_t	str_len;
+	uint32_t	ref_count;
+} FieldString;
+
+typedef struct	{
+	uint64_t field_buckets[256];
+    uint32_t total_fields;
+    uint32_t pad;
+    pthread_mutex_t mutex;
+} FieldPoolHeader;
+
 typedef struct {
     uint64_t next_offset;
 	uint64_t field_offset;
@@ -366,10 +382,12 @@ typedef struct {
     uint64_t shm_size;
 	uint64_t bucket_offset;
 	uint64_t heap_header_offset;
+//	uint64_t field_pool_offset;
     uint32_t initialized;
 	uint32_t version;
 	uint32_t hash_table_size;
 	uint32_t pad;
+	FieldPoolHeader	field_pool;
 } ShmHeader;
 
 typedef struct {
@@ -378,4 +396,22 @@ typedef struct {
 	uint64_t size;
 } ShmHandle;
 
+/* ============================================================
+ *  Set (Unordered Set)
+ * ============================================================ */
+typedef struct SetEntry {
+    uint64_t next_offset;
+    uint64_t member_offset;
+    uint32_t member_len;
+    uint32_t pad;
+} SetEntry;
+
+typedef struct {
+    uint64_t member_count;
+    uint32_t n_buckets;
+    uint32_t pad;
+    pthread_mutex_t mutex;
+    /* 뒤이어 uint64_t member_buckets[n_buckets] */
+} SetHeader;
 #endif /* SHM_TYPES_H */
+

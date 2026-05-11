@@ -6,9 +6,11 @@
 #include <strings.h>
 #include "shm_types.h"
 #include "shm_core.h"
+#include "cmd_keys.h"
 #include "cmd_kv.h"
 #include "cmd_zset.h"
 #include "cmd_hash.h"
+#include "cmd_set.h"
 #include "cmd_dispatch.h"
 
 /* ============================================================
@@ -19,8 +21,12 @@
  * ============================================================ */
 static const CmdEntry g_cmd_table[] = {
     /* ── KV ──────────────────────────────────────────────── */
+    { "KEYS",           cmd_keys,           2, "KEYS pattern"                         },
     { "SET",            cmd_set,            3, "SET key value"                        },
     { "GET",            cmd_get,            2, "GET key"                              },
+    { "MSET",           cmd_mset,           3, "MSET key1 value1 [key2 value2 ...]"   },
+    { "MGET",           cmd_mget,           2, "MGET key1 [key2 ...]"                 },
+    { "DEL",            cmd_del,            2, "DEL key [key …]"                      },
     { "DEL",            cmd_del,            2, "DEL key [key …]"                      },
 
     /* ── Sorted Set ─────────────────────────────────────── */
@@ -52,6 +58,15 @@ static const CmdEntry g_cmd_table[] = {
     { "HVALS",          cmd_hvals,          2, "HVALS key"                            },
     { "HINCRBY",        cmd_hincrby,        4, "HINCRBY key field delta"              },
     { "HINCRBYFLOAT",   cmd_hincrbyfloat,   4, "HINCRBYFLOAT key field delta"         },
+	{ "SCREATE",        cmd_screate,        2, "SCREATE key"                          },
+    { "SDROP",          cmd_sdrop,          2, "SDROP key"                            },
+    { "SADD",           cmd_sadd,           3, "SADD key member [...]"                },
+    { "SREM",           cmd_srem,           3, "SREM key member [...]"                },
+    { "SISMEMBER",      cmd_sismember,      3, "SISMEMBER key member"                 },
+    { "SCARD",          cmd_scard,          2, "SCARD key"                            },
+    { "SMEMBERS",       cmd_smembers,       2, "SMEMBERS key"                         },
+    { "SPOP",           cmd_spop,           2, "SPOP key [count]"                     },
+    { "SRANDMEMBER",    cmd_srandmember,    2, "SRANDMEMBER key [count]"              },
 };
 
 static const size_t g_cmd_count =

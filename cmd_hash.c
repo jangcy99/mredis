@@ -15,6 +15,83 @@
 #include "shm_core.h"
 #include "cmd_hash.h"
 
+/* Field 이름 Interning (재사용) */
+static uint64_t get_or_intern_field(ShmHandle *h, const void *field, uint32_t flen)
+{
+    FieldPoolHeader *fp = get_field_pool(h);
+    if (!fp) return OFFSET_NULL;
+
+    int rc = pthread_mutex_lock(&fp->mutex);
+    if (rc == EOWNERDEAD) pthread_mutex_consistent(&fp->mutex);
+
+    uint32_t bi = shm_field_hash(field, flen, 256);
+    uint64_t cur = fp->field_buckets[bi];
+
+    while (cur != OFFSET_NULL) {
+        FieldString *fs = (FieldString *)OFF2PTR(h, cur);
+        if (fs->str_len == flen &&
+            memcmp(OFF2PTR(h, fs->str_offset), field, flen) == 0) {
+            fs->ref_count++;
+            pthread_mutex_unlock(&fp->mutex);
+            return fs->str_offset;
+        }
+        cur = fs->next;
+    }
+
+    /* 신규 Intern */
+    uint64_t str_off = heap_alloc(h, flen);
+    uint64_t fs_off = heap_alloc(h, sizeof(FieldString));
+    if (str_off == OFFSET_NULL || fs_off == OFFSET_NULL) {
+        pthread_mutex_unlock(&fp->mutex);
+        return OFFSET_NULL;
+    }
+
+    memcpy(OFF2PTR(h, str_off), field, flen);
+
+    FieldString *fs = (FieldString *)OFF2PTR(h, fs_off);
+    fs->next = fp->field_buckets[bi];
+    fs->str_offset = str_off;
+    fs->str_len = flen;
+    fs->ref_count = 1;
+
+    fp->field_buckets[bi] = fs_off;
+    fp->total_fields++;
+
+    pthread_mutex_unlock(&fp->mutex);
+    return str_off;
+}
+
+static int decrease_field_ref(ShmHandle *h, const void *field, uint32_t flen) {
+    FieldPoolHeader *fp = get_field_pool(h);
+    if (!fp) return -1;
+
+    int rc = pthread_mutex_lock(&fp->mutex);
+    if (rc == EOWNERDEAD) pthread_mutex_consistent(&fp->mutex);
+
+    uint32_t bi = shm_field_hash(field, flen, 256);
+    uint64_t cur = fp->field_buckets[bi];
+	uint64_t prev = OFFSET_NULL;
+    while (cur != OFFSET_NULL) {
+        FieldString *fs = (FieldString *)OFF2PTR(h, cur);
+        if (fs->str_len == flen && memcmp(OFF2PTR(h, fs->str_offset), field, flen) == 0) {
+            fs->ref_count--;
+			if (fs->ref_count <= 0)	{
+				// FieldString삭제
+				heap_free (h, fs->str_offset);
+				if (prev == OFFSET_NULL)	fp->field_buckets[bi] = fs->next;
+				else	((FieldString*)OFF2PTR(h,prev))->next = fs->next;
+				heap_free (h, cur);
+			}
+            pthread_mutex_unlock(&fp->mutex);
+            return 0;
+        }
+		prev = cur;
+        cur = fs->next;
+    }
+	LOG_TRACE ("HSET DECREASE NOTFOUND:%.*s", flen, (char*)field);
+	pthread_mutex_unlock(&fp->mutex);
+	return -1;	// notfound 
+}
 /* ============================================================
  *  내부 헬퍼
  * ============================================================ */
@@ -144,7 +221,7 @@ static void hash_drop_fields_locked(ShmHandle *h, HashHeader *hh)
         while (cur != OFFSET_NULL) {
             FieldEntry *fe = (FieldEntry *)OFF2PTR(h, cur);
             uint64_t nxt   = fe->next_offset;
-            heap_free(h, fe->field_offset);
+			decrease_field_ref(h, OFF2PTR(h, fe->field_offset), fe->field_len);
             heap_free(h, fe->val_offset);
             heap_free(h, cur);
             cur = nxt;
@@ -297,17 +374,16 @@ s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
             LOG_TRACE("HSET: 갱신 field='%.*s'", flen, (const char *)field);
         } else {
             /* 신규 field 추가 */
-            uint64_t foff = heap_alloc(h, flen);
+            uint64_t foff = get_or_intern_field(h, field, flen);
             uint64_t voff = heap_alloc(h, vlen > 0 ? vlen : 1);
             uint64_t eoff = heap_alloc(h, sizeof(FieldEntry));
             if (foff == OFFSET_NULL || voff == OFFSET_NULL || eoff == OFFSET_NULL) {
-                if (foff != OFFSET_NULL) heap_free(h, foff);
+                if (foff != OFFSET_NULL) decrease_field_ref(h, OFF2PTR(h, foff), flen);
                 if (voff != OFFSET_NULL) heap_free(h, voff);
                 if (eoff != OFFSET_NULL) heap_free(h, eoff);
                 pthread_mutex_unlock(&hh->mutex);
                 return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
             }
-            memcpy(OFF2PTR(h, foff), field, flen);
             if (vlen > 0) memcpy(OFF2PTR(h, voff), val, vlen);
 
             FieldEntry *fe = (FieldEntry *)OFF2PTR(h, eoff);
@@ -385,7 +461,7 @@ s_replyObject *cmd_hdel(ShmHandle *h, string_t *args[], uint32_t argc)
                 memcmp(OFF2PTR(h, fe->field_offset), field, flen) == 0) {
                 if (prev == OFFSET_NULL) bkts[bi] = fe->next_offset;
                 else ((FieldEntry *)OFF2PTR(h, prev))->next_offset = fe->next_offset;
-                heap_free(h, fe->field_offset);
+				decrease_field_ref(h, OFF2PTR(h, fe->field_offset), fe->field_len);
                 heap_free(h, fe->val_offset);
                 heap_free(h, cur);
                 hh->field_count--;
@@ -559,16 +635,15 @@ static int hfield_write_str(ShmHandle *h, HashHeader *hh,
         return SHM_OK;
     }
     /* 신규 */
-    uint64_t foff = heap_alloc(h, flen);
+	uint64_t foff = get_or_intern_field(h, field, flen);
     uint64_t voff = heap_alloc(h, slen + 1);
     uint64_t eoff = heap_alloc(h, sizeof(FieldEntry));
     if (foff == OFFSET_NULL || voff == OFFSET_NULL || eoff == OFFSET_NULL) {
-        if (foff != OFFSET_NULL) heap_free(h, foff);
+        if (foff != OFFSET_NULL) decrease_field_ref(h, OFF2PTR(h, foff), flen);
         if (voff != OFFSET_NULL) heap_free(h, voff);
         if (eoff != OFFSET_NULL) heap_free(h, eoff);
         return SHM_ERR_NOMEM;
     }
-    memcpy(OFF2PTR(h, foff), field, flen);
     memcpy(OFF2PTR(h, voff), sval, slen);
     ((char *)OFF2PTR(h, voff))[slen] = '\0';
 

@@ -32,6 +32,14 @@ static inline uint64_t    *hh_field_buckets(HashHeader *hh)
 static inline SkipNode    *core_sn(ShmHandle *h, uint64_t off)
     { return (SkipNode*)OFF2PTR(h,off); }
 
+static inline FieldPoolHeader *get_field_pool(ShmHandle *h)	{
+	ShmHeader* s = (ShmHeader*)h->base;
+	return &s->field_pool;
+#if 0
+	if (s->field_pool_offset == OFFSET_NULL)	return NULL;
+	return OFF2PTR(h,s->field_pool_offset);
+#endif
+}
 /* ============================================================
  *  SHM 생명주기
  * ============================================================ */
@@ -46,6 +54,7 @@ const char *shm_strerror(int err);
 /* ============================================================
  *  해시 함수
  * ============================================================ */
+uint64_t siphash(const uint8_t *in, const size_t inlen, const uint8_t *k);
 uint32_t shm_hash(const void *key, uint32_t klen);
 uint32_t shm_field_hash(const void *f, uint32_t flen, uint32_t nbuckets);
 

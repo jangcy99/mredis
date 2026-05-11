@@ -41,17 +41,25 @@ const char *shm_strerror(int e)
 /* ──────────────────── 해시 ──────────────────────────────── */
 uint32_t shm_hash(const void *key, uint32_t klen)
 {
+	uint8_t	keydef[] = "0123456789012345";
+	return (uint32_t)siphash (key, klen, keydef) % (uint64_t)HASH_TABLE_SIZE;
+#if 0
     const uint8_t *p = (const uint8_t *)key;
     uint64_t h = 14695981039346656037ULL;
     for (uint32_t i = 0; i < klen; i++) { h ^= p[i]; h *= 1099511628211ULL; }
     return (uint32_t)(h % (uint64_t)HASH_TABLE_SIZE);
+#endif
 }
 uint32_t shm_field_hash(const void *f, uint32_t flen, uint32_t nb)
 {
+	uint8_t	keydef[] = "0123456789012345";
+	return (uint32_t)siphash (f, flen, keydef) % (uint64_t)nb;
+#if 0
     const uint8_t *p = (const uint8_t *)f;
     uint64_t h = 14695981039346656037ULL;
     for (uint32_t i = 0; i < flen; i++) { h ^= p[i]; h *= 1099511628211ULL; }
     return (uint32_t)(h % (uint64_t)nb);
+#endif
 }
 
 /* ============================================================
@@ -261,6 +269,29 @@ static void heap_init_region(ShmHandle *h, uint64_t hs, uint64_t hsz)
     LOG_INFO("Best-Fit Bin Heap 초기화 완료 (%lu MB)", hsz >> 20);
 }
 
+static int32_t create_field_pool(ShmHandle *h)
+{
+    ShmHeader *s = (ShmHeader *)h->base;
+
+#if 0
+    s->field_pool_offset = heap_alloc(h, sizeof(FieldPoolHeader));
+    if (s->field_pool_offset == OFFSET_NULL) return -1;
+#endif
+
+    FieldPoolHeader *fp = (FieldPoolHeader *)&s->field_pool;
+	for (int i = 0; i < 256; i ++)	fp->field_buckets[i] = OFFSET_NULL;
+    fp->total_fields = 0;
+
+    pthread_mutexattr_t ma;
+    pthread_mutexattr_init(&ma);
+    pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED);
+    pthread_mutexattr_setrobust(&ma, PTHREAD_MUTEX_ROBUST);
+    pthread_mutex_init(&fp->mutex, &ma);
+    pthread_mutexattr_destroy(&ma);
+
+    return 0;
+}
+
 ShmHandle *shm_create(const char *name, uint64_t size)
 {
     LOG_INFO("shm_create: %s %lu MB", name, size>>20);
@@ -289,6 +320,7 @@ ShmHandle *shm_create(const char *name, uint64_t size)
     }
     pthread_mutexattr_destroy(&ma);
     heap_init_region(h, hs, hsz);
+	create_field_pool(h);
     s->initialized = 1;
     LOG_INFO("shm_create 완료 ver=%u", s->version);
     return h;
