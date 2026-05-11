@@ -1,49 +1,49 @@
 # mredis
 현재 구현되어 있는 항목
-    /* ── KV ──────────────────────────────────────────────── */
-    { "KEYS",           cmd_keys,           2, "KEYS pattern"                         },
-    { "SET",            cmd_set,            3, "SET key value"                        },
-    { "GET",            cmd_get,            2, "GET key"                              },
-    { "MSET",           cmd_mset,           3, "MSET key1 value1 [key2 value2 ...]"   },
-    { "MGET",           cmd_mget,           2, "MGET key1 [key2 ...]"                 },
-    { "DEL",            cmd_del,            2, "DEL key [key …]"                      },
-    { "DEL",            cmd_del,            2, "DEL key [key …]"                      },
+    ── KV ────────────────────────────────────────────────
+    KEYS           : KEYS pattern
+    SET            : SET key value
+    GET            : GET key
+    MSET           : MSET key1 value1 [key2 value2 ...]
+    MGET           : MGET key1 [key2 ...]
+    DEL            : DEL key [key …]
+    DEL            : DEL key [key …]
 
-    /* ── Sorted Set ─────────────────────────────────────── */
-    { "ZCREATE",        cmd_zcreate,        2, "ZCREATE key"                          },
-    { "ZDROP",          cmd_zdrop,          2, "ZDROP key"                            },
-    { "ZADD",           cmd_zadd,           4, "ZADD key [NX|XX|GT|LT|CH] score member [score member …]" },
-    { "ZREM",           cmd_zrem,           3, "ZREM key member [member …]"           },
-    { "ZSCORE",         cmd_zscore,         3, "ZSCORE key member"                    },
-    { "ZINCRBY",        cmd_zincrby,        4, "ZINCRBY key delta member"             },
-    { "ZRANK",          cmd_zrank,          3, "ZRANK key member"                     },
-    { "ZREVRANK",       cmd_zrevrank,       3, "ZREVRANK key member"                  },
-    { "ZCARD",          cmd_zcard,          2, "ZCARD key"                            },
-    { "ZCOUNT",         cmd_zcount,         4, "ZCOUNT key min max"                   },
-    { "ZRANGE",         cmd_zrange,         4, "ZRANGE key start stop [REV]"          },
-    { "ZRANGEBYSCORE",  cmd_zrangebyscore,  4, "ZRANGEBYSCORE key min max [REV] [LIMIT offset count]" },
-    { "ZPOPMIN",        cmd_zpopmin,        2, "ZPOPMIN key [count]"                  },
-    { "ZPOPMAX",        cmd_zpopmax,        2, "ZPOPMAX key [count]"                  },
+    ── Sorted Set ─: ──────────────
+    ZCREATE        : ZCREATE key
+    ZDROP          : ZDROP key
+    ZADD           : ZADD key [NX|XX|GT|LT|CH] score member [score member …]
+    ZREM           : ZREM key member [member …]
+    ZSCORE         : ZSCORE key member
+    ZINCRBY        : ZINCRBY key delta member
+    ZRANK          : ZRANK key member
+    ZREVRANK       : ZREVRANK key member
+    ZCARD          : ZCARD key
+    ZCOUNT         : ZCOUNT key min max
+    ZRANGE         : ZRANGE key start stop [REV]
+    ZRANGEBYSCORE  : ZRANGEBYSCORE key min max [REV] [LIMIT offset count]
+    ZPOPMIN        : ZPOPMIN key [count]
+    ZPOPMAX        : ZPOPMAX key [count]
 
-    /* ── Hash Map ───────────────────────────────────────── */
-    { "HCREATE",        cmd_hcreate,        2, "HCREATE key"                          },
-    { "HDROP",          cmd_hdrop,          2, "HDROP key"                            },
-    { "HSET",           cmd_hset,           4, "HSET key field value [field value …]" },
-    { "HGET",           cmd_hget,           3, "HGET key field"                       },
-    { "HDEL",           cmd_hdel,           3, "HDEL key field [field …]"             },
-    { "HEXISTS",        cmd_hexists,        3, "HEXISTS key field"                    },
-    { "HLEN",           cmd_hlen,           2, "HLEN key"                             },
-    { "HGETALL",        cmd_hgetall,        2, "HGETALL key"                          },
-    { "HKEYS",          cmd_hkeys,          2, "HKEYS key"                            },
-    { "HVALS",          cmd_hvals,          2, "HVALS key"                            },
-    { "HINCRBY",        cmd_hincrby,        4, "HINCRBY key field delta"              },
-    { "HINCRBYFLOAT",   cmd_hincrbyfloat,   4, "HINCRBYFLOAT key field delta"         },
-	{ "SCREATE",        cmd_screate,        2, "SCREATE key"                          },
-    { "SDROP",          cmd_sdrop,          2, "SDROP key"                            },
-    { "SADD",           cmd_sadd,           3, "SADD key member [...]"                },
-    { "SREM",           cmd_srem,           3, "SREM key member [...]"                },
-    { "SISMEMBER",      cmd_sismember,      3, "SISMEMBER key member"                 },
-    { "SCARD",          cmd_scard,          2, "SCARD key"                            },
-    { "SMEMBERS",       cmd_smembers,       2, "SMEMBERS key"                         },
-    { "SPOP",           cmd_spop,           2, "SPOP key [count]"                     },
-    { "SRANDMEMBER",    cmd_srandmember,    2, "SRANDMEMBER key [count]"              },
+    ── Hash Map ───: ──────────────
+    HCREATE        : HCREATE key
+    HDROP          : HDROP key
+    HSET           : HSET key field value [field value …]
+    HGET           : HGET key field
+    HDEL           : HDEL key field [field …]
+    HEXISTS        : HEXISTS key field
+    HLEN           : HLEN key
+    HGETALL        : HGETALL key
+    HKEYS          : HKEYS key
+    HVALS          : HVALS key
+    HINCRBY        : HINCRBY key field delta
+    HINCRBYFLOAT   : HINCRBYFLOAT key field delta
+	SCREATE        : SCREATE key
+    SDROP          : SDROP key
+    SADD           : SADD key member [...]
+    SREM           : SREM key member [...]
+    SISMEMBER      : SISMEMBER key member
+    SCARD          : SCARD key
+    SMEMBERS       : SMEMBERS key
+    SPOP           : SPOP key [count]
+    SRANDMEMBER    : SRANDMEMBER key [count]
