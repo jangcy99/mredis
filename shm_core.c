@@ -373,6 +373,20 @@ uint64_t bucket_find_locked(ShmHandle *h, BucketEntry *bk,
     if (op) *op = prev;
 	return OFFSET_NULL;
 }
+uint32_t bucket_find_entry_number(ShmHandle *h, BucketEntry *bk,
+                              const void *key, uint32_t klen)
+                              
+{
+    uint64_t cur = bk->head_offset;
+    while (cur != OFFSET_NULL) {
+        NameEntry *ne = (NameEntry *)OFF2PTR(h, cur);
+        if (ne->key_len == klen && memcmp(OFF2PTR(h, ne->key_offset), key, klen) == 0)	return ne->type;
+            
+        cur = ne->next_offset;
+    }
+	return UINT32_MAX;
+}
+
 uint64_t bucket_find(ShmHandle *h, uint32_t idx, const void *key, uint32_t klen,
                       uint32_t tf, uint64_t *op)
 {

@@ -14,6 +14,6 @@ s_replyObject *cmd_set(ShmHandle *h, string_t *args[], uint32_t argc);
 s_replyObject *cmd_get(ShmHandle *h, string_t *args[], uint32_t argc);
 s_replyObject *cmd_mset(ShmHandle *h, string_t *args[], uint32_t argc);
 s_replyObject *cmd_mget(ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_del(ShmHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_kdel(ShmHandle *h, string_t *args[], uint32_t argc);
 
 #endif /* CMD_KV_H */

@@ -167,7 +167,8 @@ static void test_key_unique(ShmHandle *h)
     CHECK(is_err(r,SHM_ERR_KEY_EXISTS),"ZSet이름으로 SET →KEY_EXISTS"); reply_free(r);
     run(h,"ZADD","dup_zs","1.0","m",NULL);
     r = run(h,"ZCARD","dup_zs",NULL); CHECK(is_int(r,1),"ZSet 무결성 유지"); reply_free(r);
-    run(h,"ZDROP","dup_zs",NULL);
+//    run(h,"ZDROP","dup_zs",NULL);
+    run(h,"DEL","dup_zs",NULL);
 
     SECT("7. 키 전역 유일 – Hash → ZSet 중복");
     run(h,"HCREATE","dup_hh",NULL);
@@ -175,7 +176,8 @@ static void test_key_unique(ShmHandle *h)
     r = run(h,"ZCREATE","dup_hh",NULL);
     CHECK(is_err(r,SHM_ERR_KEY_EXISTS),"Hash이름으로 ZCREATE →KEY_EXISTS"); reply_free(r);
     r = run(h,"HEXISTS","dup_hh","f1",NULL); CHECK(is_int(r,1),"Hash 무결성 유지"); reply_free(r);
-    run(h,"HDROP","dup_hh",NULL);
+//    run(h,"HDROP","dup_hh",NULL);
+    run(h,"DEL","dup_hh",NULL);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -203,7 +205,8 @@ static void test_zset_basic(ShmHandle *h)
     r = run(h,"ZCARD","sc",NULL);      CHECK(is_int(r,2),"ZCARD==2 after ZREM"); reply_free(r);
     r = run(h,"ZREM","sc","ghost",NULL); CHECK(is_int(r,0),"ZREM ghost →0"); reply_free(r);
 
-    run(h,"ZDROP","sc",NULL);
+//    run(h,"ZDROP","sc",NULL);
+    run(h,"DEL","sc",NULL);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -239,7 +242,8 @@ static void test_zset_flags(ShmHandle *h)
     r = run(h,"ZADD","fl","CH","42.0","m",NULL); CHECK(is_int(r,1),"CH 변경 →1"); reply_free(r);
     r = run(h,"ZADD","fl","CH","42.0","m",NULL); CHECK(is_int(r,0),"CH 동일 →0"); reply_free(r);
 
-    run(h,"ZDROP","fl",NULL);
+//    run(h,"ZDROP","fl",NULL);
+    run(h,"DEL","fl",NULL);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -271,7 +275,8 @@ static void test_zset_misc(ShmHandle *h)
     r = run(h,"ZCOUNT","ms","1","4",NULL);CHECK(is_int(r,4),"ZCOUNT [1,4]==4"); reply_free(r);
     r = run(h,"ZCOUNT","ms","0","100",NULL); CHECK(is_int(r,5),"ZCOUNT [0,100]==5"); reply_free(r);
 
-    run(h,"ZDROP","ms",NULL);
+//    run(h,"ZDROP","ms",NULL);
+    run(h,"DEL","ms",NULL);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -330,7 +335,8 @@ static void test_zset_range(ShmHandle *h)
     if(r&&r->elements>=1) CHECK(!strcmp((char*)r->element[0]->ptr,"epsilon"),"ZPOPMAX[0]==epsilon");
     reply_free(r);
 
-    run(h,"ZDROP","rng",NULL);
+//    run(h,"ZDROP","rng",NULL);
+    run(h,"DEL","rng",NULL);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -359,7 +365,8 @@ static void test_hash_basic(ShmHandle *h)
     r = run(h,"HLEN","user:1",NULL); CHECK(is_int(r,2),"HLEN==2 after HDEL"); reply_free(r);
     r = run(h,"HDEL","user:1","ghost",NULL); CHECK(is_int(r,0),"HDEL ghost →0"); reply_free(r);
 
-    run(h,"HDROP","user:1",NULL);
+//    run(h,"HDROP","user:1",NULL);
+    run(h,"DEL","user:1",NULL);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -392,7 +399,8 @@ static void test_hash_getall(ShmHandle *h)
     r = run(h,"HKEYS","item:1",NULL); CHECK(is_arr(r,3),"HKEYS 3 원소"); reply_free(r);
     r = run(h,"HVALS","item:1",NULL); CHECK(is_arr(r,3),"HVALS 3 원소"); reply_free(r);
 
-    run(h,"HDROP","item:1",NULL);
+//    run(h,"HDROP","item:1",NULL);
+    run(h,"DEL","item:1",NULL);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -413,7 +421,8 @@ static void test_hash_incr(ShmHandle *h)
     r = run(h,"HINCRBYFLOAT","ctr","rate","0.3",NULL);
     CHECK(r&&r->type==REPLY_STRING&&fabs(to_dbl(r)-1.8)<1e-9,"HINCRBYFLOAT +0.3 →1.8"); reply_free(r);
 
-    run(h,"HDROP","ctr",NULL);
+//    run(h,"HDROP","ctr",NULL);
+    run(h,"DEL","ctr",NULL);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -618,6 +627,7 @@ static void test_multiproc(void)
 
     /* 정리 */
     run(h,"ZDROP","mp_zs",NULL); run(h,"HDROP","mp_hh",NULL);
+//    run(h,"DEL","mp_zs",NULL); run(h,"DEL","mp_hh",NULL);
     for(int p=0;p<MP_PROC;p++) for(int i=0;i<MP_KV;i++){
         char k[32]; snprintf(k,sizeof(k),"kv_p%d_%03d",p,i); run(h,"DEL",k,NULL);
     }

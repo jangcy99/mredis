@@ -26,8 +26,7 @@ static const CmdEntry g_cmd_table[] = {
     { "GET",            cmd_get,            2, "GET key"                              },
     { "MSET",           cmd_mset,           3, "MSET key1 value1 [key2 value2 ...]"   },
     { "MGET",           cmd_mget,           2, "MGET key1 [key2 ...]"                 },
-    { "DEL",            cmd_del,            2, "DEL key [key …]"                      },
-    { "DEL",            cmd_del,            2, "DEL key [key …]"                      },
+    { "KDEL",           cmd_kdel,           2, "KDEL key [key …]"                     },
 
     /* ── Sorted Set ─────────────────────────────────────── */
     { "ZCREATE",        cmd_zcreate,        2, "ZCREATE key"                          },
@@ -72,6 +71,53 @@ static const CmdEntry g_cmd_table[] = {
 static const size_t g_cmd_count =
     sizeof(g_cmd_table) / sizeof(g_cmd_table[0]);
 
+static const EraseEntry g_erase_table[] = {
+    { ENTRY_KV,           cmd_kdel            },
+    { ENTRY_ZSET,         cmd_zdrop           },
+    { ENTRY_HASH,         cmd_hdrop           },
+    { ENTRY_SET,          cmd_sdrop           },
+};
+static const size_t g_erase_count =
+    sizeof(g_erase_table) / sizeof(g_erase_table[0]);
+
+/* ── DEL ─────────────────────────────────────────────────────
+ *  args: DEL key [key …]
+ *  반환: INTEGER 삭제 수
+ * ─────────────────────────────────────────────────────────── */
+s_replyObject *cmd_del(ShmHandle *h, string_t *args[], uint32_t argc)
+{
+    if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: DEL key [key …]");
+
+    int64_t removed = 0;
+    for (uint32_t a = 1; a < argc; a++) {
+        const void *key = args[a]->ptr; uint32_t klen = args[a]->len;
+        if (klen == 0) continue;
+
+        uint32_t idx    = shm_hash(key, klen);
+        BucketEntry *bk = core_get_bucket(h, idx);
+        bucket_lock(h, idx);
+
+		uint32_t entry = bucket_find_entry_number(h, bk, key, klen);
+        pthread_mutex_unlock(&bk->mutex);
+        if (entry == UINT32_MAX) continue;
+
+		for (uint32_t j = 0; j < g_erase_count; j++)	{
+			if (entry == g_erase_table[j].entry_number)	{
+				string_t *get_args[2] = {
+					&STR_LIT("DEL"),
+					args[a]
+				};
+				s_replyObject *r = g_erase_table[j].fn(h, get_args, 2);
+				if (r && r->type == REPLY_INTEGER && r->integer == 1) {
+					LOG_TRACE("DEL: '%.*s'", klen, (const char *)key);
+					removed++;
+					break;
+				}
+			}
+		}
+    }
+    return reply_integer(removed);
+}
 /* ============================================================
  *  공개 API
  * ============================================================ */
@@ -89,6 +135,7 @@ s_replyObject *cmd_dispatch(ShmHandle *h,
         return reply_error(SHM_ERR_INVAL, "빈 커맨드");
 
     const char *name = args[0]->ptr;
+	if (strcmp (name, "DEL") == 0) return cmd_del(h, args, argc);
     for (size_t i = 0; i < g_cmd_count; i++) {
         if (strcasecmp(name, g_cmd_table[i].name) == 0) {
             /* 최소 인자 수 검사 */

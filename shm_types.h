@@ -98,8 +98,7 @@
 #define ENTRY_KV     1u
 #define ENTRY_ZSET   2u
 #define ENTRY_HASH   3u
-#define ENTRY_ZHSET  4u
-#define ENTRY_SET    5u
+#define ENTRY_SET    4u
 /* ============================================================
  *  string_t  –  길이 포함 바이트열
  * ============================================================ */

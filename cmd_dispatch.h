@@ -32,6 +32,10 @@ typedef struct {
     const char *usage;
 } CmdEntry;
 
+typedef struct	{
+	uint32_t	entry_number;
+	CmdFunc		fn;
+} EraseEntry;
 /*
  * cmd_dispatch
  *   args[0] 의 커맨드 이름을 찾아 해당 함수를 호출한다.

@@ -171,13 +171,13 @@ s_replyObject *cmd_mget(ShmHandle *h, string_t *args[], uint32_t argc)
 
     return arr;
 }
-/* ── DEL ─────────────────────────────────────────────────────
- *  args: DEL key [key …]
+/* ── KDEL ─────────────────────────────────────────────────────
+ *  args: KDEL key [key …]
  *  반환: INTEGER 삭제 수
  * ─────────────────────────────────────────────────────────── */
-s_replyObject *cmd_del(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_kdel(ShmHandle *h, string_t *args[], uint32_t argc)
 {
-    if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: DEL key [key …]");
+    if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: KDEL key [key …]");
 
     int64_t removed = 0;
     for (uint32_t a = 1; a < argc; a++) {
@@ -203,7 +203,7 @@ s_replyObject *cmd_del(ShmHandle *h, string_t *args[], uint32_t argc)
         nameentry_free(h, ne_off);
         pthread_mutex_unlock(&bk->mutex);
         removed++;
-        LOG_TRACE("DEL: '%.*s'", klen, (const char *)key);
+        LOG_TRACE("KDEL: '%.*s'", klen, (const char *)key);
     }
     return reply_integer(removed);
 }

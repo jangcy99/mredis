@@ -71,6 +71,8 @@ void     bucket_lock(ShmHandle *h, uint32_t idx);
 uint64_t bucket_find_locked(ShmHandle *h, BucketEntry *bk,
                               const void *key, uint32_t klen,
                               uint32_t type_filter, uint64_t *out_prev);
+uint32_t bucket_find_entry_number(ShmHandle *h, BucketEntry *bk,
+                              const void *key, uint32_t klen);
 uint64_t bucket_find(ShmHandle *h, uint32_t idx,
                       const void *key, uint32_t klen,
                       uint32_t type_filter, uint64_t *out_prev);
