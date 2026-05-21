@@ -9,6 +9,7 @@ C 언어로 작성되었으며, 멀티프로세스 환경에서도 안전하게 
 - **String / KV** (`SET`, `GET`, `DEL`, `MSET`, `MGET`)
 - **Hash** (`HCREATE`, `HSET`, `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HINCRBY`, `HINCRBYFLOAT`)
 - **Sorted Set** (`ZCREATE`, `ZADD`, `ZRANGE`, `ZPOPMIN`, `ZCARD`, `ZSCORE` 등)
+                  (`BSET`, `BGET`, `BRANGE`, `BRANGEBYSCORE`..)
 - **Set** (`SCREATE`, `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SPOP`, `SRANDMEMBER`, `SISMEMBER`)
 
 ### 서버 기능
@@ -51,6 +52,9 @@ Sorted Set
 ZCREATE, ZDROP, ZADD, ZREM, ZCARD, ZSCORE, ZRANK
 ZRANGE, ZRANGEBYSCORE, ZPOPMIN, ZPOPMAX
 
+BDROP, BSET, BREM, BCARD, BSCORE, BRANK
+BRANGE, BRANGEBYSCORE, BPOPMIN, BPOPMAX
+
 Set
 
 SCREATE, SDROP, SADD, SREM, SISMEMBER, SCARD
@@ -89,7 +93,8 @@ IPC: POSIX Shared Memory
 메모리 효율: Field Interning (Hash), Best-Fit Heap
 Redis 호환: redis-cli로 바로 사용 가능
 멀티프로세스: fork 안전 설계
+SORTEDSET: ZIPLIST, BINARY KEY BLOCK
 📄 라이선스
 MIT License
 
-개발자: Claude + Grok + 사용자 협업
+개발자: Claude + Grok + jangcy99
