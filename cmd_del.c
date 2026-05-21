@@ -36,6 +36,7 @@
 #include "shm_core.h"
 #include "cmd_zset.h"
 #include "cmd_hash.h"
+#include "cmd_bset.h"
 #include "cmd_del.h"
 
 /* ============================================================
@@ -189,6 +190,43 @@ static int drop_hash(ShmHandle *h, const void *key, uint32_t klen)
     return SHM_OK;
 }
 
+static int drop_bset(ShmHandle *h, const void *key, uint32_t klen)
+{
+    uint32_t     idx = shm_hash(key, klen);
+    BucketEntry *bk  = core_get_bucket(h, idx);
+    bucket_lock(h, idx);
+
+    uint64_t prev   = OFFSET_NULL;
+    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_BSET, &prev);
+    if (ne_off == OFFSET_NULL) {
+        pthread_mutex_unlock(&bk->mutex);
+        return SHM_ERR_NOT_FOUND;
+    }
+    NameEntry  *ne    = (NameEntry *)OFF2PTR(h, ne_off);
+    uint64_t    bh_off = ne->data_offset;
+    BSetHeader *bh     = (BSetHeader *)OFF2PTR(h, bh_off);
+
+    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
+    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
+    nameentry_free(h, ne_off);
+    pthread_mutex_unlock(&bk->mutex);
+
+    int rc = pthread_mutex_lock(&bh->mutex);
+    if (rc == EOWNERDEAD) pthread_mutex_consistent(&bh->mutex);
+
+    BSetEntry *arr = (BSetEntry *)OFF2PTR(h, bh->array_offset);
+    for (uint64_t i = 0; i < bh->count; i++)
+        heap_free(h, arr[i].offset);
+    heap_free(h, bh->array_offset);
+
+    pthread_mutex_unlock(&bh->mutex);
+    pthread_mutex_destroy(&bh->mutex);
+    heap_free(h, bh_off);
+
+    LOG_TRACE("DEL(BSET): '%.*s'", klen, (const char *)key);
+    return SHM_OK;
+}
+
 /* ============================================================
  *  §2  DEL 라우팅 테이블
  *
@@ -198,6 +236,7 @@ static const DelRouteEntry g_del_route[] = {
     { ENTRY_KV,   "KV",   drop_kv   },
     { ENTRY_ZSET, "ZSET", drop_zset },
     { ENTRY_HASH, "HASH", drop_hash },
+    { ENTRY_BSET, "BSET", drop_bset },
     /*
      * 향후 추가 예시:
      * { ENTRY_ZHSET, "ZHSET", drop_zhset },

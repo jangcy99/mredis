@@ -49,6 +49,7 @@ void        shm_close(ShmHandle *h);
 void        shm_destroy(const char *name);
 void        shm_set_debug_level(int level);
 void        shm_dump_stats(ShmHandle *h);
+void		shm_statistics(ShmHandle *h, char *p);
 const char *shm_strerror(int err);
 
 /* ============================================================
@@ -77,6 +78,7 @@ uint64_t bucket_find(ShmHandle *h, uint32_t idx,
                       const void *key, uint32_t klen,
                       uint32_t type_filter, uint64_t *out_prev);
 
+int type_check(ShmHandle *h, BucketEntry *bk, const void *key, uint32_t klen, uint32_t type, uint64_t *out_ne);
 /* ============================================================
  *  NameEntry
  * ============================================================ */
@@ -84,6 +86,7 @@ uint64_t nameentry_alloc(ShmHandle *h, const void *key, uint32_t klen,
                           uint32_t type, uint64_t data_off);
 void     nameentry_free(ShmHandle *h, uint64_t ne_off);
 
+void	pthread_mutex_initialize(pthread_mutex_t *p_mutex);
 /* ============================================================
  *  ZSetHeader / HashHeader 조회
  * ============================================================ */

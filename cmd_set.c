@@ -41,17 +41,6 @@ static uint64_t setheader_new(ShmHandle *h)
     return off;
 }
 
-/* Set 타입 체크 */
-static int set_type_check(ShmHandle *h, BucketEntry *bk, const void *key, uint32_t klen, uint64_t *out_ne)
-{
-    uint64_t ne = bucket_find_locked(h, bk, key, klen, 0, NULL);
-    if (ne == OFFSET_NULL) { if (out_ne) *out_ne = OFFSET_NULL; return 1; }
-    NameEntry *nep = (NameEntry *)OFF2PTR(h, ne);
-    if (nep->type != ENTRY_SET) return SHM_ERR_KEY_EXISTS;
-    if (out_ne) *out_ne = ne;
-    return 0;
-}
-
 /* Set 가져오기 */
 static SetHeader *set_get(ShmHandle *h, const void *key, uint32_t klen)
 {
@@ -71,7 +60,7 @@ static SetHeader *set_get_or_create(ShmHandle *h, const void *key, uint32_t klen
     bucket_lock(h, idx);
 
     uint64_t ne_off = OFFSET_NULL;
-    int chk = set_type_check(h, bk, key, klen, &ne_off);
+    int chk = type_check(h, bk, key, klen, ENTRY_SET, &ne_off);
 
     if (chk == SHM_ERR_KEY_EXISTS) {
         pthread_mutex_unlock(&bk->mutex);
@@ -121,7 +110,7 @@ s_replyObject *cmd_screate(ShmHandle *h, string_t *args[], uint32_t argc)
     bucket_lock(h, idx);
 
     uint64_t ne_off = OFFSET_NULL;
-    int chk = set_type_check(h, bk, key, klen, &ne_off);
+    int chk = type_check(h, bk, key, klen, ENTRY_SET, &ne_off);
 
     if (chk == SHM_ERR_KEY_EXISTS) {
         pthread_mutex_unlock(&bk->mutex);

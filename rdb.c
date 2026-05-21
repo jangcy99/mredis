@@ -26,7 +26,7 @@
  *      ZSET: [uint64_t cnt] [cnt × (double score, uint32_t mlen, char m[mlen])]
  *      HASH: [uint64_t cnt] [cnt × (uint32_t flen, char f[flen],
  *                                   uint32_t vlen, char v[vlen])]
- *  [uint8_t RDB_TYPE_EOF]
+ *  [uint8_t ENTRY_EOF]
  *  [uint32_t crc32]   ← 헤더부터 EOF 바이트까지 전체 CRC
  */
 
@@ -197,7 +197,7 @@ static void save_kv(ShmHandle *h, RdbWriter *w,
                     const char *key, uint32_t klen, NameEntry *ne)
 {
     KVNode *kv = (KVNode*)OFF2PTR(h, ne->data_offset);
-    RW_U8 (w, RDB_TYPE_KV);
+    RW_U8 (w, ENTRY_KV);
     RW_STR(w, key, klen);
     if (kv->val_len>0)
         RW_STR(w,(const char*)OFF2PTR(h,kv->val_offset),kv->val_len);
@@ -209,7 +209,7 @@ static void save_zset(ShmHandle *h, RdbWriter *w,
                       const char *key, uint32_t klen, NameEntry *ne)
 {
     ZSetHeader *zsh = (ZSetHeader*)OFF2PTR(h, ne->data_offset);
-    RW_U8 (w, RDB_TYPE_ZSET);
+    RW_U8 (w, ENTRY_ZSET);
     RW_STR(w, key, klen);
     RW_U64(w, zsh->length);
     uint64_t cur = core_sn(h, zsh->head_offset)->forward[0];
@@ -226,7 +226,7 @@ static void save_hash(ShmHandle *h, RdbWriter *w,
 {
     HashHeader *hh   = (HashHeader*)OFF2PTR(h, ne->data_offset);
     uint64_t   *bkts = hh_field_buckets(hh);
-    RW_U8 (w, RDB_TYPE_HASH);
+    RW_U8 (w, ENTRY_HASH);
     RW_STR(w, key, klen);
     RW_U64(w, hh->field_count);
     for (uint32_t i=0; i<hh->n_buckets; i++) {
@@ -239,6 +239,24 @@ static void save_hash(ShmHandle *h, RdbWriter *w,
             else
                 RW_STR(w,"",0);
             cur = fe->next_offset;
+        }
+    }
+}
+
+static void save_set(ShmHandle *h, RdbWriter *w,
+                      const char *key, uint32_t klen, NameEntry *ne)
+{
+    SetHeader *sh   = (SetHeader*)OFF2PTR(h, ne->data_offset);
+    uint64_t   *bkts = (uint64_t*)(sh + 1);
+    RW_U8 (w, ENTRY_SET);
+    RW_STR(w, key, klen);
+    RW_U64(w, sh->member_count);
+    for (uint32_t i=0; i<sh->n_buckets; i++) {
+        uint64_t cur = bkts[i];
+        while (cur != OFFSET_NULL) {
+            SetEntry *se = (SetEntry*)OFF2PTR(h,cur);
+            RW_STR(w,(const char*)OFF2PTR(h,se->member_offset),se->member_len);
+            cur = se->next_offset;
         }
     }
 }
@@ -297,6 +315,7 @@ int rdb_save(RdbHandle *rdb, ShmHandle *shm)
             case ENTRY_KV:   save_kv  (shm,&w,key,klen,ne); break;
             case ENTRY_ZSET: save_zset(shm,&w,key,klen,ne); break;
             case ENTRY_HASH: save_hash(shm,&w,key,klen,ne); break;
+            case ENTRY_SET: save_set(shm,&w,key,klen,ne); break;
             default: break;
             }
             cur = ne->next_offset;
@@ -306,7 +325,7 @@ int rdb_save(RdbHandle *rdb, ShmHandle *shm)
     }
 
     /* (4) EOF 마커 */
-    RW_U8(&w, RDB_TYPE_EOF);
+    RW_U8(&w, ENTRY_EOF);
 
     if (w.err) {
         close(fd); unlink(tmp);
@@ -414,6 +433,31 @@ static int load_hash(RdbReader *r, ShmHandle *shm,
     return r->err?-1:0;
 }
 
+static int load_set(RdbReader *r, ShmHandle *shm,
+                     const char *key, uint32_t klen)
+{
+    uint64_t cnt=rr_u64(r);
+    if (r->err) return -1;
+
+    /* HCREATE key */
+    string_t sk={key,klen},scrt={"SCREATE",7};
+    string_t *cargs[]={&scrt,&sk};
+    s_replyObject *rep=cmd_dispatch(shm,cargs,2);
+    reply_free(rep);
+
+    for (uint64_t i=0;i<cnt;i++) {
+        uint32_t memberlen; char *member=rr_str(r,&memberlen);
+        if (r->err||!member){free(member);return -1;}
+        string_t sf={member,memberlen};
+        string_t scmd={"SADD",4};
+        string_t *args[]={&scmd,&sk,&sf};
+        rep=cmd_dispatch(shm,args,3);
+        reply_free(rep);
+        free(member);
+    }
+    return r->err?-1:0;
+}
+
 /* ============================================================
  *  §8  rdb_load
  * ============================================================ */
@@ -467,16 +511,17 @@ int64_t rdb_load(RdbHandle *rdb, ShmHandle *shm)
     while (!rr.err) {
         uint8_t type=rr_u8(&rr);
         if (rr.err) break;
-        if (type==RDB_TYPE_EOF) break;
+        if (type==ENTRY_EOF) break;
 
         uint32_t klen; char *key=rr_str(&rr,&klen);
         if (rr.err||!key){free(key);break;}
 
         int rc=0;
         switch (type) {
-        case RDB_TYPE_KV:   rc=load_kv  (&rr,shm,key,klen);break;
-        case RDB_TYPE_ZSET: rc=load_zset(&rr,shm,key,klen);break;
-        case RDB_TYPE_HASH: rc=load_hash(&rr,shm,key,klen);break;
+        case ENTRY_KV:   rc=load_kv  (&rr,shm,key,klen);break;
+        case ENTRY_ZSET: rc=load_zset(&rr,shm,key,klen);break;
+        case ENTRY_HASH: rc=load_hash(&rr,shm,key,klen);break;
+        case ENTRY_SET:  rc=load_set(&rr,shm,key,klen);break;
         default:
             fprintf(stderr,"RDB: 알 수 없는 타입 0x%02x\n",type);
             free(key);fclose(fp);return loaded;

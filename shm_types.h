@@ -64,6 +64,7 @@
 #define SHM_ERR_TYPE        (-8)
 #define SHM_ERR_ARGC        (-9)
 #define SHM_ERR_PARSE       (-10)
+#define SHM_ERR_INTERNAL    (-11)
 
 /* ============================================================
  *  디버그 레벨
@@ -99,6 +100,10 @@
 #define ENTRY_ZSET   2u
 #define ENTRY_HASH   3u
 #define ENTRY_SET    4u
+
+#ifndef ENTRY_BSET
+#define ENTRY_BSET  5u
+#endif
 /* ============================================================
  *  string_t  –  길이 포함 바이트열
  * ============================================================ */
@@ -322,8 +327,11 @@ typedef struct {
 } SkipNode;
 
 typedef struct {
-    uint64_t head_offset; uint64_t tail_offset; uint64_t length;
-    uint32_t cur_level;   uint32_t pad;
+    uint64_t head_offset;
+	uint64_t tail_offset;
+	uint64_t length;
+    uint32_t cur_level;
+	uint32_t pad;
     pthread_mutex_t mutex;
 } ZSetHeader;
 

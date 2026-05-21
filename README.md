@@ -10,7 +10,6 @@ C 언어로 작성되었으며, 멀티프로세스 환경에서도 안전하게 
 - **Hash** (`HCREATE`, `HSET`, `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HINCRBY`, `HINCRBYFLOAT`)
 - **Sorted Set** (`ZCREATE`, `ZADD`, `ZRANGE`, `ZPOPMIN`, `ZCARD`, `ZSCORE` 등)
 - **Set** (`SCREATE`, `SADD`, `SREM`, `SMEMBERS`, `SCARD`, `SPOP`, `SRANDMEMBER`, `SISMEMBER`)
-- **Pub/Sub** (`PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`)
 
 ### 서버 기능
 - **RESP 프로토콜** 완벽 지원 (`redis-cli` 바로 사용 가능)

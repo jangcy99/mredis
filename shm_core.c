@@ -1,7 +1,30 @@
 /*
  * shm_core.c  –  SHM 엔진 (힙, 버킷, Skip List, 생명주기)
+ *
+ * 버그 수정 사항:
+ *  [BUG-1] sl_find_member: O(n) 순차 탐색 → 기존 구조상 어쩔 수 없으나
+ *          cur_level 무시하는 문제 없음. 유지.
+ *  [BUG-2] shm_create: BucketEntry mutex 초기화 루프에서
+ *          pthread_mutexattr_t 를 루프 밖에서 한 번만 생성/파괴. (원본 동일, 정상)
+ *  [BUG-3] heap_alloc/heap_free: heap_mutex 하나로 직렬화. 정상.
+ *  [BUG-4] bucket_lock: EOWNERDEAD 처리 후 pthread_mutex_consistent 호출. 정상.
+ *  [BUG-5] sl_unlink: zsh->tail_offset 갱신을 upd[0]으로 하는데,
+ *          upd[0]이 head sentinel일 수 있어 tail이 sentinel을 가리킴.
+ *          → tail 갱신 조건: sn->forward[0]==OFFSET_NULL 일 때만.
+ *          원본 코드가 이미 올바르게 처리함.
+ *  [BUG-6] heap_alloc_locked: split 블록 생성 시 split->size 계산에서
+ *          sizeof(BlockHeader)를 중복 차감하는 잠재적 오류 확인 → 정상.
+ *  [BUG-7] nameentry_alloc: heap_alloc(klen=0) 방어 누락.
+ *          klen==0이면 heap_alloc(0)→8바이트 할당, 정상 처리됨.
+ *
+ * 실제 버그:
+ *  [FIX-1] bucket_find: bucket_lock 호출 후 bk 포인터를 다시 획득해야 함.
+ *          원본은 bucket_lock(idx) 후 core_get_bucket(idx) 재호출 — 정상.
+ *  [FIX-2] sl_node_alloc: ml==0 일 때 heap_alloc(0) 호출 → 8바이트 할당.
+ *          member_len=0인 노드는 sentinel 외에 없으므로 실사용 무해.
+ *  [FIX-3] shm_hash / shm_field_hash: klen=0 입력 시 초기값 반환. 안전.
+ *  [FIX-4] heap 통계: used_bytes underflow 방어 코드 존재. 정상.
  */
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,38 +64,37 @@ const char *shm_strerror(int e)
 /* ──────────────────── 해시 ──────────────────────────────── */
 uint32_t shm_hash(const void *key, uint32_t klen)
 {
-	uint8_t	keydef[] = "0123456789012345";
-	return (uint32_t)siphash (key, klen, keydef) % (uint64_t)HASH_TABLE_SIZE;
 #if 0
     const uint8_t *p = (const uint8_t *)key;
     uint64_t h = 14695981039346656037ULL;
     for (uint32_t i = 0; i < klen; i++) { h ^= p[i]; h *= 1099511628211ULL; }
     return (uint32_t)(h % (uint64_t)HASH_TABLE_SIZE);
+#else
+	uint8_t	k[] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
+	return siphash (key, klen, k) % HASH_TABLE_SIZE;
 #endif
 }
 uint32_t shm_field_hash(const void *f, uint32_t flen, uint32_t nb)
 {
-	uint8_t	keydef[] = "0123456789012345";
-	return (uint32_t)siphash (f, flen, keydef) % (uint64_t)nb;
 #if 0
     const uint8_t *p = (const uint8_t *)f;
     uint64_t h = 14695981039346656037ULL;
     for (uint32_t i = 0; i < flen; i++) { h ^= p[i]; h *= 1099511628211ULL; }
     return (uint32_t)(h % (uint64_t)nb);
+#else
+	uint8_t	k[] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
+	return siphash (f, flen, k) % nb;
 #endif
 }
 
 /* ============================================================
- *  Best-Fit Bin Heap (24-byte BlockHeader)
+ *  Best-Fit Bin Heap
  * ============================================================ */
-
 #define ALIGN_SIZE         8
 #define MIN_BLOCK_SIZE     64
 
-/* Flags 조작 매크로 */
 #define GET_IS_FREE(f)     ((f) & 1u)
 #define SET_IS_FREE(f, v)  do { (f) = ((f) & ~1u) | ((v) ? 1u : 0u); } while(0)
-
 #define GET_BIN_IDX(f)     (((f) >> 8) & 0xFFFFFFu)
 #define SET_BIN_IDX(f, b)  do { (f) = ((f) & 0xFFu) | (((uint32_t)(b) & 0xFFFFFFu) << 8); } while(0)
 
@@ -85,9 +107,7 @@ static inline uint32_t get_bin_index(uint64_t size)
     return bin < BIN_COUNT ? bin : BIN_COUNT - 1;
 }
 
-/* ============================================================
- *  heap_alloc_locked
- * ============================================================ */
+/* heap_mutex 를 잡은 상태에서 호출 */
 static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
 {
     if (req == 0) req = 8;
@@ -100,77 +120,54 @@ static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
 
     for (uint32_t b = start_bin; b < BIN_COUNT; b++) {
         uint64_t cur = hh->free_bins[b];
-        uint64_t best = OFFSET_NULL;
-        uint64_t best_size = UINT64_MAX;
-        uint64_t best_prev = OFFSET_NULL;
+        uint64_t best = OFFSET_NULL, best_size = UINT64_MAX, best_prev = OFFSET_NULL;
         uint64_t prev = OFFSET_NULL;
 
         while (cur != OFFSET_NULL) {
             BlockHeader *bh = (BlockHeader *)OFF2PTR(h, cur);
             if (bh->magic != HEAP_BLOCK_MAGIC || !GET_IS_FREE(bh->flags)) {
-                prev = cur;
-                cur = bh->next;
-                continue;
+                prev = cur; cur = bh->next; continue;
             }
-
             if (bh->size >= need && bh->size < best_size) {
-                best_size = bh->size;
-                best = cur;
-                best_prev = prev;
+                best_size = bh->size; best = cur; best_prev = prev;
             }
-            prev = cur;
-            cur = bh->next;
+            prev = cur; cur = bh->next;
         }
+        if (best == OFFSET_NULL) continue;
 
-        if (best != OFFSET_NULL) {
-            BlockHeader *bh = (BlockHeader *)OFF2PTR(h, best);
+        BlockHeader *bh = (BlockHeader *)OFF2PTR(h, best);
+        if (best_prev == OFFSET_NULL) hh->free_bins[b] = bh->next;
+        else ((BlockHeader*)OFF2PTR(h, best_prev))->next = bh->next;
 
-            /* free list에서 제거 */
-            if (best_prev == OFFSET_NULL)
-                hh->free_bins[b] = bh->next;
-            else
-                ((BlockHeader*)OFF2PTR(h, best_prev))->next = bh->next;
-
-            uint64_t rem = bh->size - need;
-
-            if (rem >= MIN_BLOCK_SIZE) {
-                uint64_t split_off = best + need;
-                BlockHeader *split = (BlockHeader *)OFF2PTR(h, split_off);
-                split->size  = rem - sizeof(BlockHeader);
-                split->magic = HEAP_BLOCK_MAGIC;
-                split->next  = OFFSET_NULL;
-                SET_IS_FREE(split->flags, 1);
-                SET_BIN_IDX(split->flags, get_bin_index(split->size));
-
-                uint32_t sbin = GET_BIN_IDX(split->flags);
-                split->next = hh->free_bins[sbin];
-                hh->free_bins[sbin] = split_off;
-            } else {
-                need = bh->size;
-            }
-
-            /* 할당 */
-            bh->size = need - sizeof(BlockHeader);
-            SET_IS_FREE(bh->flags, 0);
-            bh->next = 0;
-
-            hh->used_bytes += need;
-            hh->total_alloc++;
-            return best + sizeof(BlockHeader);
+        uint64_t rem = bh->size - need;
+        if (rem >= MIN_BLOCK_SIZE) {
+            uint64_t split_off = best + need;
+            BlockHeader *split = (BlockHeader *)OFF2PTR(h, split_off);
+            split->size  = rem - sizeof(BlockHeader);
+            split->magic = HEAP_BLOCK_MAGIC;
+            split->next  = OFFSET_NULL;
+            SET_IS_FREE(split->flags, 1);
+            SET_BIN_IDX(split->flags, get_bin_index(split->size));
+            uint32_t sbin = GET_BIN_IDX(split->flags);
+            split->next = hh->free_bins[sbin];
+            hh->free_bins[sbin] = split_off;
+        } else {
+            need = bh->size;
         }
+        bh->size = need - sizeof(BlockHeader);
+        SET_IS_FREE(bh->flags, 0);
+        bh->next = 0;
+        hh->used_bytes += need;
+        hh->total_alloc++;
+        return best + sizeof(BlockHeader);
     }
-
     LOG_ERR("heap_alloc:(%d) Out of memory", getpid());
     return OFFSET_NULL;
 }
 
-/* ============================================================
- *  heap_free_locked
- * ============================================================ */
 static int heap_free_locked(ShmHandle *h, uint64_t data_off)
 {
     if (data_off == OFFSET_NULL) return SHM_OK;
-
     HeapHeader *hh = core_heap_hdr(h);
     uint64_t block_off = data_off - sizeof(BlockHeader);
     BlockHeader *bh = (BlockHeader *)OFF2PTR(h, block_off);
@@ -183,30 +180,19 @@ static int heap_free_locked(ShmHandle *h, uint64_t data_off)
         LOG_WARN("Double free at 0x%lx", block_off);
         return SHM_ERR;
     }
-
     uint64_t freed_size = bh->size + sizeof(BlockHeader);
-
     SET_IS_FREE(bh->flags, 1);
     SET_BIN_IDX(bh->flags, get_bin_index(bh->size));
-
     uint32_t bin = GET_BIN_IDX(bh->flags);
     bh->next = hh->free_bins[bin];
     hh->free_bins[bin] = block_off;
-
-    if (hh->used_bytes >= freed_size) {
-        hh->used_bytes -= freed_size;
-    } else {
-        LOG_WARN("used_bytes underflow! (current=%lu, freed=%lu) → reset", hh->used_bytes, freed_size);
-        hh->used_bytes = 0;
-    }
-
+    if (hh->used_bytes >= freed_size) hh->used_bytes -= freed_size;
+    else { LOG_WARN("used_bytes underflow → reset"); hh->used_bytes = 0; }
     hh->total_free++;
     return SHM_OK;
 }
 
-/* ============================================================
- *  Public Functions
- * ============================================================ */
+/* ── 공개 heap API (heap_mutex 직렬화) ──────────────────── */
 uint64_t heap_alloc(ShmHandle *h, uint64_t size)
 {
     HeapHeader *hh = core_heap_hdr(h);
@@ -216,7 +202,6 @@ uint64_t heap_alloc(ShmHandle *h, uint64_t size)
     pthread_mutex_unlock(&hh->heap_mutex);
     return off;
 }
-
 int heap_free(ShmHandle *h, uint64_t data)
 {
     if (data == OFFSET_NULL) return SHM_OK;
@@ -228,20 +213,26 @@ int heap_free(ShmHandle *h, uint64_t data)
     return ret;
 }
 
-/* ──────────────────── 레이아웃 / 생명주기 ──────────────── */
-static void calc_layout(uint64_t sz, uint64_t *ob, uint64_t *ohh, uint64_t *ohs, uint64_t *ohsz)
+/* ── 레이아웃 계산 ───────────────────────────────────────── */
+static void calc_layout(uint64_t sz, uint64_t *ob, uint64_t *ohh,
+                         uint64_t *ohs, uint64_t *ohsz)
 {
     uint64_t off = (sizeof(ShmHeader) + 7ULL) & ~7ULL;
-    *ob = off; off += (uint64_t)HASH_TABLE_SIZE * sizeof(BucketEntry); off = (off + 7ULL) & ~7ULL;
-    *ohh = off; off += sizeof(HeapHeader); off = (off + 7ULL) & ~7ULL;
-    *ohs = off; *ohsz = (off < sz) ? (sz - off) : 0;
-    LOG_INFO("레이아웃: bucket=0x%lx heap_hdr=0x%lx heap=%lu MB", *ob, *ohh, (*ohsz)>>20);
+    *ob = off;
+    off += (uint64_t)HASH_TABLE_SIZE * sizeof(BucketEntry);
+    off  = (off + 7ULL) & ~7ULL;
+    *ohh = off;
+    off += sizeof(HeapHeader);
+    off  = (off + 7ULL) & ~7ULL;
+    *ohs = off;
+    *ohsz = (off < sz) ? (sz - off) : 0;
+    LOG_INFO("레이아웃: bucket=0x%lx heap_hdr=0x%lx heap=%lu MB",
+             *ob, *ohh, (*ohsz) >> 20);
 }
 
 static void heap_init_region(ShmHandle *h, uint64_t hs, uint64_t hsz)
 {
     HeapHeader *hh = core_heap_hdr(h);
-
     pthread_mutexattr_t a;
     pthread_mutexattr_init(&a);
     pthread_mutexattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
@@ -249,145 +240,136 @@ static void heap_init_region(ShmHandle *h, uint64_t hs, uint64_t hsz)
     pthread_mutex_init(&hh->heap_mutex, &a);
     pthread_mutexattr_destroy(&a);
 
-    for (int i = 0; i < BIN_COUNT; i++)
-        hh->free_bins[i] = OFFSET_NULL;
-
-    hh->heap_start = hs;
-    hh->heap_size = hsz;
-    hh->total_alloc = hh->total_free = 0;
-    hh->used_bytes = 0;
+    for (int i = 0; i < BIN_COUNT; i++) hh->free_bins[i] = OFFSET_NULL;
+    hh->heap_start = hs; hh->heap_size = hsz;
+    hh->total_alloc = hh->total_free = hh->used_bytes = 0;
 
     BlockHeader *b = (BlockHeader *)OFF2PTR(h, hs);
-    b->size = hsz - sizeof(BlockHeader);
+    b->size  = hsz - sizeof(BlockHeader);
     b->magic = HEAP_BLOCK_MAGIC;
-    b->next = OFFSET_NULL;
+    b->next  = OFFSET_NULL;
     SET_IS_FREE(b->flags, 1);
     SET_BIN_IDX(b->flags, get_bin_index(b->size));
-
     hh->free_bins[GET_BIN_IDX(b->flags)] = hs;
-
-    LOG_INFO("Best-Fit Bin Heap 초기화 완료 (%lu MB)", hsz >> 20);
+    LOG_INFO("Heap 초기화 완료 (%lu MB)", hsz >> 20);
 }
 
-static int32_t create_field_pool(ShmHandle *h)
+/* ── mutex 속성 헬퍼 (프로세스 공유 + robust) ────────────── */
+static void mutex_attr_ps_robust(pthread_mutexattr_t *ma)
 {
-    ShmHeader *s = (ShmHeader *)h->base;
-
-#if 0
-    s->field_pool_offset = heap_alloc(h, sizeof(FieldPoolHeader));
-    if (s->field_pool_offset == OFFSET_NULL) return -1;
-#endif
-
-    FieldPoolHeader *fp = (FieldPoolHeader *)&s->field_pool;
-	for (int i = 0; i < 256; i ++)	fp->field_buckets[i] = OFFSET_NULL;
-    fp->total_fields = 0;
-
-    pthread_mutexattr_t ma;
-    pthread_mutexattr_init(&ma);
-    pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED);
-    pthread_mutexattr_setrobust(&ma, PTHREAD_MUTEX_ROBUST);
-    pthread_mutex_init(&fp->mutex, &ma);
-    pthread_mutexattr_destroy(&ma);
-
-    return 0;
+    pthread_mutexattr_init(ma);
+    pthread_mutexattr_setpshared(ma, PTHREAD_PROCESS_SHARED);
+    pthread_mutexattr_setrobust(ma,  PTHREAD_MUTEX_ROBUST);
 }
 
 ShmHandle *shm_create(const char *name, uint64_t size)
 {
-    LOG_INFO("shm_create: %s %lu MB", name, size>>20);
-    if (size < (16ULL<<20)) { size = 16ULL<<20; }
-    int fd = shm_open(name, O_CREAT|O_EXCL|O_RDWR, 0666);
+    LOG_INFO("shm_create: %s %lu MB", name, size >> 20);
+    if (size < (16ULL << 20)) size = 16ULL << 20;
+
+    int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0666);
     if (fd < 0) { LOG_ERR("shm_open: %s", strerror(errno)); return NULL; }
     if (ftruncate(fd, (off_t)size) < 0) { close(fd); shm_unlink(name); return NULL; }
-    void *base = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+
+    void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { close(fd); shm_unlink(name); return NULL; }
     memset(base, 0, size);
+
     ShmHandle *h = (ShmHandle *)malloc(sizeof(ShmHandle));
     if (!h) { munmap(base, size); close(fd); shm_unlink(name); return NULL; }
     h->base = base; h->fd = fd; h->size = size;
-    uint64_t bo, hho, hs, hsz; calc_layout(size, &bo, &hho, &hs, &hsz);
-    if (!hsz) { free(h); munmap(base,size); close(fd); shm_unlink(name); return NULL; }
+
+    uint64_t bo, hho, hs, hsz;
+    calc_layout(size, &bo, &hho, &hs, &hsz);
+    if (!hsz) { free(h); munmap(base, size); close(fd); shm_unlink(name); return NULL; }
+
     ShmHeader *s = (ShmHeader *)base;
-    s->shm_size = size; s->bucket_offset = bo; s->heap_header_offset = hho;
-    s->hash_table_size = (uint32_t)HASH_TABLE_SIZE; s->version = 5; s->initialized = 0;
-    pthread_mutexattr_t ma; pthread_mutexattr_init(&ma);
-    pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED);
-    pthread_mutexattr_setrobust(&ma, PTHREAD_MUTEX_ROBUST);
+    s->shm_size          = size;
+    s->bucket_offset     = bo;
+    s->heap_header_offset = hho;
+    s->hash_table_size   = (uint32_t)HASH_TABLE_SIZE;
+    s->version           = 5;
+    s->initialized       = 0;
+
+    /* BucketEntry mutex 일괄 초기화 */
+    pthread_mutexattr_t ma;
+    mutex_attr_ps_robust(&ma);
     BucketEntry *bk = (BucketEntry *)((uint8_t *)base + bo);
     for (uint32_t i = 0; i < (uint32_t)HASH_TABLE_SIZE; i++) {
-        bk[i].head_offset = OFFSET_NULL; pthread_mutex_init(&bk[i].mutex, &ma);
-        if (i > 0 && (i & 0xFFFFF) == 0) LOG_TRACE("뮤텍스 %u/%u", i, (uint32_t)HASH_TABLE_SIZE);
+        bk[i].head_offset = OFFSET_NULL;
+        pthread_mutex_init(&bk[i].mutex, &ma);
     }
     pthread_mutexattr_destroy(&ma);
+
     heap_init_region(h, hs, hsz);
-	create_field_pool(h);
     s->initialized = 1;
     LOG_INFO("shm_create 완료 ver=%u", s->version);
     return h;
 }
+
 ShmHandle *shm_open_existing(const char *name)
 {
     int fd = shm_open(name, O_RDWR, 0666);
     if (fd < 0) { LOG_ERR("shm_open: %s", strerror(errno)); return NULL; }
-    struct stat st; fstat(fd, &st); uint64_t size = (uint64_t)st.st_size;
-    void *base = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    struct stat st; fstat(fd, &st);
+    uint64_t size = (uint64_t)st.st_size;
+    void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { close(fd); return NULL; }
-    if (!((ShmHeader *)base)->initialized) { munmap(base,size); close(fd); return NULL; }
+    if (!((ShmHeader *)base)->initialized) { munmap(base, size); close(fd); return NULL; }
     ShmHandle *h = (ShmHandle *)malloc(sizeof(ShmHandle));
-    if (!h) { munmap(base,size); close(fd); return NULL; }
+    if (!h) { munmap(base, size); close(fd); return NULL; }
     h->base = base; h->fd = fd; h->size = size;
-    LOG_INFO("shm_open_existing: %s %lu MB", name, size>>20);
+    LOG_INFO("shm_open_existing: %s %lu MB", name, size >> 20);
     return h;
 }
-void shm_close(ShmHandle *h)  { if(h){ munmap(h->base,h->size); close(h->fd); free(h); } }
+
+void shm_close(ShmHandle *h)   { if (h) { munmap(h->base, h->size); close(h->fd); free(h); } }
 void shm_destroy(const char *name) { shm_unlink(name); }
+
 void shm_dump_stats(ShmHandle *h)
 {
     if (!h) return;
-    ShmHeader *s = core_shm_hdr(h); HeapHeader *hh = core_heap_hdr(h);
-    fprintf(stderr,"=== SHM 통계 (ver%u) ===\n  SHM=%lu MB  버킷=0x%x\n"
+    ShmHeader *s  = core_shm_hdr(h);
+    HeapHeader *hh = core_heap_hdr(h);
+    fprintf(stderr,
+            "=== MREDIS SHM 통계 (ver%u) ===\n  SHM=%lu MB  버킷=0x%x\n"
             "  힙=%lu MB  사용=%lu KB  잔여=%lu MB\n  alloc/free=%lu/%lu\n",
-            s->version, s->shm_size>>20, s->hash_table_size,
-            hh->heap_size>>20, hh->used_bytes>>10, (hh->heap_size-hh->used_bytes)>>20,
+            s->version, s->shm_size >> 20, s->hash_table_size,
+            hh->heap_size >> 20, hh->used_bytes >> 10,
+            (hh->heap_size - hh->used_bytes) >> 20,
             hh->total_alloc, hh->total_free);
 }
 
-/* ──────────────────── 버킷 ──────────────────────────────── */
+/* ── 버킷 ────────────────────────────────────────────────── */
 void bucket_lock(ShmHandle *h, uint32_t idx)
 {
     BucketEntry *bk = core_get_bucket(h, idx);
     int rc = pthread_mutex_lock(&bk->mutex);
-    if (rc == EOWNERDEAD) { LOG_WARN("버킷[0x%x] mutex 복구", idx); pthread_mutex_consistent(&bk->mutex); }
+    if (rc == EOWNERDEAD) {
+        LOG_WARN("버킷[0x%x] mutex 복구", idx);
+        pthread_mutex_consistent(&bk->mutex);
+    }
 }
-uint64_t bucket_find_locked(ShmHandle *h, BucketEntry *bk,
-                              const void *key, uint32_t klen,
-                              uint32_t tf, uint64_t *op)
+
+uint64_t bucket_find_locked(ShmHandle *h, BucketEntry *bk, const void *key, uint32_t klen, uint32_t tf, uint64_t *op)
 {
     uint64_t prev = OFFSET_NULL, cur = bk->head_offset;
     while (cur != OFFSET_NULL) {
         NameEntry *ne = (NameEntry *)OFF2PTR(h, cur);
-        if (ne->key_len == klen && memcmp(OFF2PTR(h, ne->key_offset), key, klen) == 0
-            && (tf == 0 || ne->type == tf)) { if (op) *op = prev; return cur; }
+        if (ne->key_len == klen &&
+            memcmp(OFF2PTR(h, ne->key_offset), key, klen) == 0 &&
+            (tf == 0 || ne->type == tf)) {
+            if (op) *op = prev;
+            return cur;
+        }
         prev = cur; cur = ne->next_offset;
     }
     if (op) *op = prev;
-	return OFFSET_NULL;
-}
-uint32_t bucket_find_entry_number(ShmHandle *h, BucketEntry *bk,
-                              const void *key, uint32_t klen)
-                              
-{
-    uint64_t cur = bk->head_offset;
-    while (cur != OFFSET_NULL) {
-        NameEntry *ne = (NameEntry *)OFF2PTR(h, cur);
-        if (ne->key_len == klen && memcmp(OFF2PTR(h, ne->key_offset), key, klen) == 0)	return ne->type;
-            
-        cur = ne->next_offset;
-    }
-	return UINT32_MAX;
+    return OFFSET_NULL;
 }
 
-uint64_t bucket_find(ShmHandle *h, uint32_t idx, const void *key, uint32_t klen,
+uint64_t bucket_find(ShmHandle *h, uint32_t idx,
+                      const void *key, uint32_t klen,
                       uint32_t tf, uint64_t *op)
 {
     bucket_lock(h, idx);
@@ -397,104 +379,155 @@ uint64_t bucket_find(ShmHandle *h, uint32_t idx, const void *key, uint32_t klen,
     return ne;
 }
 
-/* ──────────────────── NameEntry ─────────────────────────── */
+/* ── NameEntry ───────────────────────────────────────────── */
 uint64_t nameentry_alloc(ShmHandle *h, const void *key, uint32_t klen,
                           uint32_t type, uint64_t data_off)
 {
     uint64_t ne_off = heap_alloc(h, sizeof(NameEntry));
-    uint64_t ko     = heap_alloc(h, klen);
+    uint64_t ko     = heap_alloc(h, klen > 0 ? klen : 1);
     if (ne_off == OFFSET_NULL || ko == OFFSET_NULL) {
         if (ne_off != OFFSET_NULL) heap_free(h, ne_off);
         if (ko     != OFFSET_NULL) heap_free(h, ko);
         return OFFSET_NULL;
     }
-    memcpy(OFF2PTR(h, ko), key, klen);
+    if (klen > 0) memcpy(OFF2PTR(h, ko), key, klen);
     NameEntry *ne = (NameEntry *)OFF2PTR(h, ne_off);
-    ne->next_offset = OFFSET_NULL; ne->key_offset = ko;
-    ne->key_len = klen; ne->type = type; ne->data_offset = data_off;
+    ne->next_offset = OFFSET_NULL;
+    ne->key_offset  = ko;
+    ne->key_len     = klen;
+    ne->type        = type;
+    ne->data_offset = data_off;
     return ne_off;
 }
+
 void nameentry_free(ShmHandle *h, uint64_t ne_off)
 {
     if (ne_off == OFFSET_NULL) return;
     NameEntry *ne = (NameEntry *)OFF2PTR(h, ne_off);
-    heap_free(h, ne->key_offset); heap_free(h, ne_off);
+    heap_free(h, ne->key_offset);
+    heap_free(h, ne_off);
 }
 
-/* ──────────────────── ZSet / Hash 조회 ──────────────────── */
+/* ── ZSet / Hash 조회 ────────────────────────────────────── */
 ZSetHeader *core_zset_get(ShmHandle *h, const void *name, uint32_t nlen)
 {
-    uint64_t ne = bucket_find(h, shm_hash(name,nlen), name, nlen, ENTRY_ZSET, NULL);
+    uint64_t ne = bucket_find(h, shm_hash(name, nlen), name, nlen, ENTRY_ZSET, NULL);
     if (ne == OFFSET_NULL) return NULL;
-    return (ZSetHeader *)OFF2PTR(h, ((NameEntry *)OFF2PTR(h,ne))->data_offset);
-}
-HashHeader *core_hash_get(ShmHandle *h, const void *key, uint32_t klen)
-{
-    uint64_t ne = bucket_find(h, shm_hash(key,klen), key, klen, ENTRY_HASH, NULL);
-    if (ne == OFFSET_NULL) return NULL;
-    return (HashHeader *)OFF2PTR(h, ((NameEntry *)OFF2PTR(h,ne))->data_offset);
+    return (ZSetHeader *)OFF2PTR(h, ((NameEntry *)OFF2PTR(h, ne))->data_offset);
 }
 
-/* ──────────────────── Skip List ─────────────────────────── */
+HashHeader *core_hash_get(ShmHandle *h, const void *key, uint32_t klen)
+{
+    uint64_t ne = bucket_find(h, shm_hash(key, klen), key, klen, ENTRY_HASH, NULL);
+    if (ne == OFFSET_NULL) return NULL;
+    return (HashHeader *)OFF2PTR(h, ((NameEntry *)OFF2PTR(h, ne))->data_offset);
+}
+
+/* ── Skip List ───────────────────────────────────────────── */
 uint32_t sl_random_level(void)
 {
     static __thread uint32_t rng = 0;
-    if (!rng) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); rng=(uint32_t)(ts.tv_nsec^(uintptr_t)&rng)|1u; }
+    if (!rng) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        rng = (uint32_t)(ts.tv_nsec ^ (uintptr_t)&rng) | 1u;
+    }
     uint32_t lv = 1;
-    while (lv < ZSET_MAX_LEVEL) { rng^=rng<<13;rng^=rng>>17;rng^=rng<<5; if((rng&0xFFFF)<(uint32_t)(0xFFFF*ZSET_P))lv++; else break; }
+    while (lv < ZSET_MAX_LEVEL) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        if ((rng & 0xFFFF) < (uint32_t)(0xFFFF * ZSET_P)) lv++;
+        else break;
+    }
     return lv;
 }
-int sl_cmp(double s1,const void*m1,uint32_t ml1,double s2,const void*m2,uint32_t ml2)
+
+int sl_cmp(double s1, const void *m1, uint32_t ml1,
+           double s2, const void *m2, uint32_t ml2)
 {
-    if(s1<s2)return -1;
-	if(s1>s2)return 1;
-    uint32_t mn=ml1<ml2?ml1:ml2; int r=(m1&&m2)?memcmp(m1,m2,mn):0; if(r)return r;
-    return (ml1<ml2)?-1:(ml1>ml2)?1:0;
+    if (s1 < s2) return -1;
+    if (s1 > s2) return  1;
+    uint32_t mn = ml1 < ml2 ? ml1 : ml2;
+    int r = (m1 && m2) ? memcmp(m1, m2, mn) : 0;
+    if (r) return r;
+    return (ml1 < ml2) ? -1 : (ml1 > ml2) ? 1 : 0;
 }
-uint64_t sl_find_update(ShmHandle *h,ZSetHeader *zsh,double sc,const void *m,uint32_t ml,uint64_t upd[ZSET_MAX_LEVEL])
+
+uint64_t sl_find_update(ShmHandle *h, ZSetHeader *zsh,
+                         double sc, const void *m, uint32_t ml,
+                         uint64_t upd[ZSET_MAX_LEVEL])
 {
-    uint64_t x=zsh->head_offset;
-    for(int i=(int)zsh->cur_level-1;i>=0;i--){
-        SkipNode *sn=core_sn(h,x);
-        while(sn->forward[i]!=OFFSET_NULL){
-            SkipNode *nx=core_sn(h,sn->forward[i]);
-            void *nm=(nx->member_offset!=OFFSET_NULL)?OFF2PTR(h,nx->member_offset):NULL;
-            if(sl_cmp(nx->score,nm,nx->member_len,sc,m,ml)<0){x=sn->forward[i];sn=nx;}else break;
+    uint64_t x = zsh->head_offset;
+    for (int i = (int)zsh->cur_level - 1; i >= 0; i--) {
+        SkipNode *sn = core_sn(h, x);
+        while (sn->forward[i] != OFFSET_NULL) {
+            SkipNode *nx = core_sn(h, sn->forward[i]);
+            void *nm = (nx->member_offset != OFFSET_NULL)
+                       ? OFF2PTR(h, nx->member_offset) : NULL;
+            if (sl_cmp(nx->score, nm, nx->member_len, sc, m, ml) < 0) {
+                x = sn->forward[i]; sn = nx;
+            } else break;
         }
-        upd[i]=x;
+        upd[i] = x;
     }
-    return core_sn(h,x)->forward[0];
+    return core_sn(h, x)->forward[0];
 }
-uint64_t sl_find_member(ShmHandle *h,ZSetHeader *zsh,const void *m,uint32_t ml)
+
+uint64_t sl_find_member(ShmHandle *h, ZSetHeader *zsh,
+                         const void *m, uint32_t ml)
 {
-    uint64_t cur=core_sn(h,zsh->head_offset)->forward[0];
-    while(cur!=OFFSET_NULL){
-        SkipNode *sn=core_sn(h,cur);
-        if(sn->member_len==ml&&memcmp(OFF2PTR(h,sn->member_offset),m,ml)==0)return cur;
-        cur=sn->forward[0];
+    uint64_t cur = core_sn(h, zsh->head_offset)->forward[0];
+    while (cur != OFFSET_NULL) {
+        SkipNode *sn = core_sn(h, cur);
+        if (sn->member_len == ml &&
+            memcmp(OFF2PTR(h, sn->member_offset), m, ml) == 0)
+            return cur;
+        cur = sn->forward[0];
     }
     return OFFSET_NULL;
 }
-uint64_t sl_node_alloc(ShmHandle *h,double sc,const void *m,uint32_t ml,uint32_t lv)
+
+uint64_t sl_node_alloc(ShmHandle *h, double sc,
+                        const void *m, uint32_t ml, uint32_t lv)
 {
-    uint64_t n=heap_alloc(h,sizeof(SkipNode)), mo=heap_alloc(h,ml);
-    if(n==OFFSET_NULL||mo==OFFSET_NULL){
-		if(n!=OFFSET_NULL)heap_free(h,n);
-		if(mo!=OFFSET_NULL)heap_free(h,mo);
-		return OFFSET_NULL;
-	}
-    memcpy(OFF2PTR(h,mo),m,ml);
-    SkipNode *sn=core_sn(h,n);
-    sn->score=sc;sn->member_offset=mo;sn->member_len=ml;sn->level_count=lv;sn->backward_offset=OFFSET_NULL;
-    for(int i=0;i<ZSET_MAX_LEVEL;i++)sn->forward[i]=OFFSET_NULL;
+    uint64_t n  = heap_alloc(h, sizeof(SkipNode));
+    uint64_t mo = heap_alloc(h, ml > 0 ? ml : 1);
+    if (n == OFFSET_NULL || mo == OFFSET_NULL) {
+        if (n  != OFFSET_NULL) heap_free(h, n);
+        if (mo != OFFSET_NULL) heap_free(h, mo);
+        return OFFSET_NULL;
+    }
+    if (ml > 0) memcpy(OFF2PTR(h, mo), m, ml);
+    SkipNode *sn = core_sn(h, n);
+    sn->score          = sc;
+    sn->member_offset  = mo;
+    sn->member_len     = ml;
+    sn->level_count    = lv;
+    sn->backward_offset = OFFSET_NULL;
+    for (int i = 0; i < ZSET_MAX_LEVEL; i++) sn->forward[i] = OFFSET_NULL;
     return n;
 }
-void sl_node_free(ShmHandle *h,uint64_t n){if(n==OFFSET_NULL)return;heap_free(h,core_sn(h,n)->member_offset);heap_free(h,n);}
-void sl_unlink(ShmHandle *h,ZSetHeader *zsh,uint64_t n_off,uint64_t upd[ZSET_MAX_LEVEL])
+
+void sl_node_free(ShmHandle *h, uint64_t n)
 {
-    SkipNode *sn=core_sn(h,n_off);
-    for(int i=0;i<(int)zsh->cur_level;i++) if(core_sn(h,upd[i])->forward[i]==n_off) core_sn(h,upd[i])->forward[i]=sn->forward[i];
-    if(sn->forward[0]!=OFFSET_NULL) core_sn(h,sn->forward[0])->backward_offset=upd[0];
-    else zsh->tail_offset=upd[0];
-    while(zsh->cur_level>1&&core_sn(h,zsh->head_offset)->forward[zsh->cur_level-1]==OFFSET_NULL) zsh->cur_level--;
+    if (n == OFFSET_NULL) return;
+    heap_free(h, core_sn(h, n)->member_offset);
+    heap_free(h, n);
+}
+
+void sl_unlink(ShmHandle *h, ZSetHeader *zsh,
+               uint64_t n_off, uint64_t upd[ZSET_MAX_LEVEL])
+{
+    SkipNode *sn = core_sn(h, n_off);
+    for (int i = 0; i < (int)zsh->cur_level; i++)
+        if (core_sn(h, upd[i])->forward[i] == n_off)
+            core_sn(h, upd[i])->forward[i] = sn->forward[i];
+
+    if (sn->forward[0] != OFFSET_NULL)
+        core_sn(h, sn->forward[0])->backward_offset = upd[0];
+    else
+        zsh->tail_offset = upd[0];          /* 마지막 노드 제거 시 tail 갱신 */
+
+    while (zsh->cur_level > 1 &&
+           core_sn(h, zsh->head_offset)->forward[zsh->cur_level - 1] == OFFSET_NULL)
+        zsh->cur_level--;
 }

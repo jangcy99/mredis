@@ -1,78 +1,87 @@
+# ═══════════════════════════════════════════════════════
+#  mredis Makefile
+# ═══════════════════════════════════════════════════════
+
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -g
+CFLAGS  = -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE -D_REENTRANT
 LDFLAGS = -lrt -lpthread -lm
 
-# ── 소스 파일 ─────────────────────────────────────────────
-CORE_SRCS  = shm_core.c siphash.c
-CMD_SRCS   = cmd_kv.c cmd_zset.c cmd_hash.c cmd_dispatch.c cmd_keys.c cmd_set.c rdb.c
-TEST_SRCS  = test_all.c
-ALL_SRCS   = $(CORE_SRCS) $(CMD_SRCS) $(TEST_SRCS)
+# ── 컴파일 파라미터 ──────────────────────────────────────
+#
+#  CI 빌드  (작은 SHM, 테스트 전용)
+#    HASH_TABLE_SIZE=0x10000   = 64K 버킷  (SHM 약 3MB)
+#    HASH_FIELD_BUCKETS=16
+#
+#  PROD 빌드 (운영, 16M 버킷 기본값)
+#    HASH_TABLE_SIZE=0x1000000 = 16M 버킷  (SHM 약 1GB+)
+#    HASH_FIELD_BUCKETS=16
+#
+CI_DEFS  = -DHASH_TABLE_SIZE=0x10000ULL \
+           -DHASH_FIELD_BUCKETS=16U      \
+           -DSHM_DEBUG_LEVEL=1
 
-LIB_SRCS	=  $(CORE_SRCS) $(CMD_SRCS)
+PROD_DEFS = -DHASH_FIELD_BUCKETS=16U \
+            -DSHM_DEBUG_LEVEL=1
 
-CORE_OBJS	= $(CORE_SRCS:.c=.o)
-CMD_OBJS	= $(CMD_SRCS:.c=.o)
-ALL_OBJS	= $(ALL_SRCS:.c=.o)
+# ── 소스 파일 ────────────────────────────────────────────
+CORE_SRCS = shm_core.c siphash.c
+CMD_SRCS  = cmd_kv.c cmd_zset.c cmd_hash.c cmd_keys.c \
+            cmd_del.c cmd_dispatch.c cmd_pubsub.c cmd_bset.c
 
-# ── 운영 빌드 (4GB, 16M 버킷) ─────────────────────────────
-TARGET     = test_all
-PROD_FLAGS = -DSHM_DEBUG_LEVEL=3
+ALL_SRCS  = $(CORE_SRCS) $(CMD_SRCS)
 
-# ── CI 빌드 (64MB, 64K 버킷) ──────────────────────────────
-TARGET_CI  = test_ci
-CI_FLAGS   = -DHASH_TABLE_SIZE=0x100000ULL \
-             -DHASH_FIELD_BUCKETS=16U \
-             -DSHM_DEBUG_LEVEL=3
+# ── 헤더 (변경 시 전체 재빌드) ───────────────────────────
+HDRS = shm_types.h shm_core.h \
+       cmd_kv.h cmd_zset.h cmd_hash.h cmd_keys.h \
+       cmd_del.h cmd_dispatch.h cmd_pubsub.h cmd_bset.h
 
-.PHONY: all ci clean run run_ci server stress
+.PHONY: all ci prod test clean
 
-.SUFFIXES : .c .o
-.c.o	:
-		$(CC) $(CFLAGS) $<
+# 기본 타겟: CI 빌드로 테스트
+all: ci
 
-# 기본: CI 빌드 (메모리 절약)
-all: dep $(TARGET_CI)
+# ── CI: 테스트 빌드 + 실행 ──────────────────────────────
+ci: test_all_ci
+	@echo ""
+	@echo "────────── 테스트 실행 ──────────"
 
-run_ci: $(TARGET_CI)
-	./$(TARGET_CI)
+test_all_ci: $(ALL_SRCS) test_all.c $(HDRS)
+	$(CC) $(CFLAGS) $(CI_DEFS) -o $@ \
+	    $(ALL_SRCS) test_all.c $(LDFLAGS)
 
-# 운영 빌드
-prod: $(TARGET)
+# ── PROD: 운영 서버 빌드 ────────────────────────────────
+prod: resp_server
+resp_server: $(ALL_SRCS) resp_server.c $(HDRS)
+	$(CC) $(CFLAGS) $(PROD_DEFS) -o $@ \
+	    $(ALL_SRCS) resp_server.c $(LDFLAGS)
 
-$(TARGET_CI): $(ALL_SRCS) shm_types.h shm_core.h cmd_kv.h cmd_zset.h cmd_hash.h cmd_dispatch.h
-	$(CC) $(CFLAGS) $(CI_FLAGS) -o $@ \
-	    $(CORE_SRCS) $(CMD_SRCS) $(TEST_SRCS) $(LDFLAGS)
+pub: test_pubsub
+test_pubsub: $(ALL_SRCS) test_pubsub.c $(HDRS)
+	$(CC) $(CFLAGS) $(CI_DEFS) -o $@ \
+	    $(ALL_SRCS) test_pubsub.c $(LDFLAGS)
 
-test_rdb: $(LIB_SRCS) shm_types.h shm_core.h cmd_kv.h cmd_zset.h cmd_hash.h cmd_dispatch.h rdb.h
-	$(CC) $(CFLAGS) $(PROD_FLAGS) -o $@ \
-	    $(CORE_SRCS) $(CMD_SRCS) test_rdb.c $(LDFLAGS)
+# ── test 타겟 (= ci) ────────────────────────────────────
+test: ci
 
-$(TARGET): $(ALL_SRCS) shm_types.h shm_core.h cmd_kv.h cmd_zset.h cmd_hash.h cmd_dispatch.h
-	$(CC) $(CFLAGS) $(PROD_FLAGS) -o $@ \
-	    $(CORE_SRCS) $(CMD_SRCS) $(TEST_SRCS) $(LDFLAGS)
+# ── 개별 오브젝트 빌드 규칙 (필요 시) ──────────────────
+%.o: %.c $(HDRS)
+	$(CC) $(CFLAGS) $(CI_DEFS) -c -o $@ $<
 
-stress: shm_core.h shm_core.c stress.c siphash.c
-	$(CC) $(CFLAGS) -o stress stress.c shm_core.c siphash.c $(LDFLAGS)
-	
-
-run: $(TARGET)
-	./$(TARGET)
-
-server: $(ALL_SRCS) resp_server.c
-	$(CC) $(CFLAGS) $(PROD_FLAGS) -o shm_server \
-	    siphash.c shm_core.c cmd_kv.c cmd_zset.c cmd_hash.c cmd_dispatch.c cmd_keys.c resp_server.c \
-	    -lrt -lpthread -lm
-
-run_server:
-	./shm_server
-
+# ── 정리 ────────────────────────────────────────────────
 clean:
-	rm -f $(TARGET) $(TARGET_CI) *.o test_rdb
-	-rm -f /dev/shm/shm_v5_test 2>/dev/null || true
+	rm -f test_all_ci resp_server *.o stress test_pubsub
+	-rm -f /dev/shm/shm_mredis_test 2>/dev/null || true
+	@echo "정리 완료"
 
-dep:
-	$(CC) -M $(CFLAGS) $(ALL_SRCS) > .depend
+stress:	$(ALL_SRCS) stress.c $(HDRS)
+	$(CC) $(CFLAGS) $(CI_DEFS) -o $@ \
+	    $(ALL_SRCS) stress.c $(LDFLAGS)
 
-ifeq (.depend,$(wildcard .depend))
-include .depend
-endif
+# ── 도움말 ──────────────────────────────────────────────
+help:
+	@echo "사용법:"
+	@echo "  make          – CI 빌드 + 테스트 실행"
+	@echo "  make ci       – CI 빌드 + 테스트 실행"
+	@echo "  make prod     – 운영 서버(resp_server) 빌드"
+	@echo "  make test     – 테스트만 실행"
+	@echo "  make clean    – 빌드 결과물 삭제"

@@ -34,12 +34,7 @@
 #define RDB_MAGIC_LEN   6
 #define RDB_VERSION     1
 
-/* ── 레코드 타입 ─────────────────────────────────────────── */
-#define RDB_TYPE_KV     0x01
-#define RDB_TYPE_ZSET   0x02
-#define RDB_TYPE_HASH   0x03
-#define RDB_TYPE_EOF    0xFF
-
+#define	ENTRY_EOF		0xff
 /* ── 기본 경로 ───────────────────────────────────────────── */
 #define RDB_DEFAULT_PATH "mredis.rdb"
 #define RDB_TMP_SUFFIX   ".tmp"

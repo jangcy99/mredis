@@ -1,72 +1,58 @@
 /*
- * test_all.c  –  통합 테스트 (s_replyObject / cmd_dispatch)
+ * test_all.c  –  mredis 전체 통합 테스트
  *
- *  모든 커맨드를 cmd_dispatch() 를 통해 호출하고
- *  반환된 s_replyObject 로 결과를 검증한다.
- *
- *  1)  KV SET / GET / DEL
- *  2)  KV 값 갱신
- *  3)  KV 없는 키 → NIL
- *  4)  키 전역 유일 – KV → ZSet 중복
- *  5)  키 전역 유일 – KV → Hash 중복
- *  6)  키 전역 유일 – ZSet → KV 중복
- *  7)  키 전역 유일 – Hash → ZSet 중복
- *  8)  ZSet ZADD / ZSCORE / ZREM
- *  9)  ZSet ZADD 플래그 NX / XX / GT / LT / CH
- * 10)  ZSet ZINCRBY / ZRANK / ZREVRANK / ZCARD / ZCOUNT
- * 11)  ZSet ZRANGE / ZRANGEBYSCORE / ZPOPMIN / ZPOPMAX
- * 12)  Hash HSET / HGET / HDEL / HEXISTS / HLEN
- * 13)  Hash HGETALL / HKEYS / HVALS
- * 14)  Hash HINCRBY / HINCRBYFLOAT
- * 15)  Hash 타입 불일치
- * 16)  Hash 대량 field
- * 17)  ZSet DROP 후 재생성
- * 18)  cmd_table_get – 커맨드 테이블 확인
- * 19)  reply_print 출력 검증 (시각 확인용)
- * 20)  멀티프로세스 동시 SET + HSET + ZADD
+ * 커버 범위:
+ *   §01  KV  : SET / GET / 갱신 / 빈값 / 타입충돌
+ *   §02  KEYS: 패턴 매칭
+ *   §03  DEL : KV·ZSET·HASH 혼합 / 없는키 / 중복키
+ *   §04  ZSET: ZCREATE/ZDROP/ZADD/ZREM/ZSCORE/ZINCRBY
+ *              ZRANK/ZREVRANK/ZCARD/ZCOUNT/ZRANGE/ZRANGEBYSCORE
+ *              ZPOPMIN/ZPOPMAX / NX·XX·GT·LT·CH 플래그
+ *   §05  HASH: HCREATE/HDROP/HSET/HGET/HDEL/HEXISTS/HLEN
+ *              HGETALL/HKEYS/HVALS/HINCRBY/HINCRBYFLOAT
+ *   §06  직렬화(serialize) 검증
+ *              - bucket_mutex: 동일 버킷에 동시 SET → 손실 없음
+ *              - zset_mutex  : 동시 ZADD → length 정확
+ *              - hash_mutex  : 동시 HSET → field_count 정확
+ *              - heap_mutex  : 동시 alloc/free → 손상 없음
+ *   §07  ZINCRBY TOCTOU 수정 검증 (단일 mutex 구간)
+ *   §08  HLEN mutex 보호 검증
+ *   §09  cmd_kv SET: 갱신 시 new-alloc-then-free 순서 검증
+ *   §10  멀티프로세스 stress (8 proc × 500 iter)
  */
-
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <stdarg.h>
 #include <math.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <sys/wait.h>
 
 #include "shm_types.h"
 #include "shm_core.h"
 #include "cmd_dispatch.h"
+#include "cmd_bset.h"
+#include "cmd_del.h"
 
-/* ─────────────────────────────────────────────────────────
- *  테스트 유틸
- * ───────────────────────────────────────────────────────── */
-#define SHM_TEST    SHM_DEFAULT_NAME
-#define PASS        "\033[32m[PASS]\033[0m"
-#define FAIL        "\033[31m[FAIL]\033[0m"
-#define SECT(t)     printf("\n\033[36m--- %s ---\033[0m\n", (t))
+/* ─── 테스트 픽스처 ────────────────────────────────────── */
+#define SHM_NAME "/shm_mredis_test"
+#define PASS     "\033[32m[PASS]\033[0m"
+#define FAIL     "\033[31m[FAIL]\033[0m"
+#define SECT(t)  printf("\n\033[36m══ %s ══\033[0m\n", (t))
 
 static int g_pass = 0, g_fail = 0;
+#define CHECK(c,m) do { \
+    if(c){printf(PASS " %s\n",(m));g_pass++;} \
+    else {printf(FAIL " %s  [L%d]\n",(m),__LINE__);g_fail++;} \
+} while(0)
 
-#define CHECK(cond, msg) \
-    do { if(cond){printf(PASS " %s\n",(msg));g_pass++;} \
-         else    {printf(FAIL " %s\n",(msg));g_fail++;} } while(0)
-
-/* ── string_t 배열 기반 dispatch 헬퍼 ─────────────────────
- *  가변 인자 문자열 → dispatch 호출 → s_replyObject* 반환
- *  사용: run(h, "SET", "key", "val", NULL)
- * ───────────────────────────────────────────────────────── */
+/* ─── cmd_dispatch 래퍼 ────────────────────────────────── */
 static s_replyObject *run(ShmHandle *h, ...)
 {
-    /* 최대 32 인자 */
-    string_t  *args[32];
-    string_t   bufs[32];
-    uint32_t   argc = 0;
-
+    string_t *args[64]; string_t bufs[64]; uint32_t argc = 0;
     va_list ap; va_start(ap, h);
-    while (argc < 32) {
+    while (argc < 64) {
         const char *s = va_arg(ap, const char *);
         if (!s) break;
         bufs[argc].ptr = s;
@@ -75,741 +61,1003 @@ static s_replyObject *run(ShmHandle *h, ...)
         argc++;
     }
     va_end(ap);
-
     return cmd_dispatch(h, args, argc);
 }
 
-/* 반환값 타입 확인 헬퍼 */
-static int is_ok   (s_replyObject *r){ return r && r->type==REPLY_STATUS && r->ptr && strcmp((char*)r->ptr,"OK")==0; }
-static int is_nil  (s_replyObject *r){ return r && r->type==REPLY_NIL; }
-static int is_int  (s_replyObject *r, int64_t v){ return r && r->type==REPLY_INTEGER && r->integer==v; }
-static int is_str  (s_replyObject *r, const char *s){ return r && r->type==REPLY_STRING && r->ptr && strcmp((char*)r->ptr,s)==0; }
-static int is_err  (s_replyObject *r, int code){ return r && r->type==REPLY_ERROR && r->integer==code; }
-static int is_arr  (s_replyObject *r, size_t n){ return r && r->type==REPLY_ARRAY && r->elements==n; }
-static double to_dbl(s_replyObject *r){ return r&&r->type==REPLY_STRING&&r->ptr?strtod((char*)r->ptr,NULL):0.0; }
+/* ─── 응답 타입 헬퍼 ───────────────────────────────────── */
+static int is_ok (s_replyObject *r)
+    { return r && r->type==REPLY_STATUS && strcmp((char*)r->ptr,"OK")==0; }
+static int is_int(s_replyObject *r, int64_t v)
+    { return r && r->type==REPLY_INTEGER && r->integer==v; }
+static int is_str(s_replyObject *r, const char *s)
+    { return r && r->type==REPLY_STRING  && strcmp((char*)r->ptr,s)==0; }
+static int is_nil(s_replyObject *r)
+    { return r && r->type==REPLY_NIL; }
+static int is_err(s_replyObject *r)
+    { return r && r->type==REPLY_ERROR; }
+static int arr_sz(s_replyObject *r, size_t n)
+    { return r && r->type==REPLY_ARRAY && r->elements==n; }
+static int arr_has(s_replyObject *r, const char *s) {
+    if (!r || r->type!=REPLY_ARRAY) return 0;
+    for (size_t i=0;i<r->elements;i++)
+        if (r->element[i] && r->element[i]->type==REPLY_STRING
+            && strcmp((char*)r->element[i]->ptr,s)==0) return 1;
 
-/* ─────────────────────────────────────────────────────────
- *  1. KV 기본 CRUD
- * ───────────────────────────────────────────────────────── */
-static void test_kv_basic(ShmHandle *h)
+    return 0;
+}
+
+/* ARRAY i번째 = 문자열 s */
+static int arr_str(s_replyObject *r,size_t i,const char *s){
+    return r&&r->type==REPLY_ARRAY&&i<r->elements
+        &&r->element[i]&&r->element[i]->type==REPLY_STRING
+        &&strcmp((char*)r->element[i]->ptr,s)==0; }
+
+/* ============================================================
+ *  §01  KV
+ * ============================================================ */
+static void t01_kv(ShmHandle *h)
 {
-    SECT("1. KV 기본 CRUD");
+    SECT("01. KV – SET / GET / 갱신 / 빈값 / 타입충돌");
     s_replyObject *r;
 
-    r = run(h,"SET","hello","world",NULL); CHECK(is_ok(r),"SET hello world"); reply_free(r);
-    r = run(h,"SET","foo","bar_12345",NULL); CHECK(is_ok(r),"SET foo bar"); reply_free(r);
-    r = run(h,"SET","empty","",NULL); CHECK(is_ok(r),"SET empty ''"); reply_free(r);
+    r=run(h,"SET","k1","hello",NULL); CHECK(is_ok(r),"SET → OK"); reply_free(r);
+    r=run(h,"GET","k1",NULL);         CHECK(is_str(r,"hello"),"GET=hello"); reply_free(r);
 
-    r = run(h,"GET","hello",NULL); CHECK(is_str(r,"world"),"GET hello==world"); reply_free(r);
-    r = run(h,"GET","foo",NULL);   CHECK(is_str(r,"bar_12345"),"GET foo==bar"); reply_free(r);
-    r = run(h,"GET","empty",NULL); CHECK(r&&r->type==REPLY_STRING&&r->len==0,"GET empty len==0"); reply_free(r);
+    /* 갱신 [FIX-1: new-alloc-then-free] */
+    r=run(h,"SET","k1","world",NULL); CHECK(is_ok(r),"SET 갱신 → OK"); reply_free(r);
+    r=run(h,"GET","k1",NULL);         CHECK(is_str(r,"world"),"GET 갱신=world"); reply_free(r);
 
-    r = run(h,"DEL","hello",NULL); CHECK(is_int(r,1),"DEL hello →1"); reply_free(r);
-    r = run(h,"GET","hello",NULL); CHECK(is_nil(r),"GET hello after DEL →NIL"); reply_free(r);
-    r = run(h,"DEL","no_key",NULL); CHECK(is_int(r,0),"DEL 없는 키 →0"); reply_free(r);
+    /* 빈 값 */
+    r=run(h,"SET","empty","",NULL);   CHECK(is_ok(r),"SET 빈값 → OK"); reply_free(r);
+    r=run(h,"GET","empty",NULL);      CHECK(r&&r->type==REPLY_STRING&&r->len==0,"GET 빈값=empty"); reply_free(r);
 
-    /* 복수 키 삭제 */
-    run(h,"SET","k1","v1",NULL); run(h,"SET","k2","v2",NULL);
-    r = run(h,"DEL","k1","k2","k3",NULL); /* k3 없음 */
-    CHECK(is_int(r,2),"DEL 복수 키 →2"); reply_free(r);
+    /* 없는 키 */
+    r=run(h,"GET","nokey",NULL); CHECK(is_nil(r),"GET 없는키→NIL"); reply_free(r);
 
-    run(h,"DEL","foo",NULL); run(h,"DEL","empty",NULL);
-}
+    /* 빈 key 거부 */
+    r=run(h,"SET","","v",NULL); CHECK(is_err(r),"SET 빈key→ERR"); reply_free(r);
 
-/* ─────────────────────────────────────────────────────────
- *  2. KV 값 갱신
- * ───────────────────────────────────────────────────────── */
-static void test_kv_update(ShmHandle *h)
-{
-    SECT("2. KV 값 갱신");
-    s_replyObject *r;
-    run(h,"SET","upk","first",NULL);
-    run(h,"SET","upk","second_longer_value",NULL);
-    r = run(h,"GET","upk",NULL); CHECK(is_str(r,"second_longer_value"),"갱신 후 새 값"); reply_free(r);
-    run(h,"SET","upk","x",NULL);
-    r = run(h,"GET","upk",NULL); CHECK(is_str(r,"x"),"짧은 값 재갱신"); reply_free(r);
-    run(h,"DEL","upk",NULL);
-}
+    /* 타입 충돌: ZADD 후 SET */
+    run(h,"ZADD","ztype","1","m",NULL);
+    r=run(h,"SET","ztype","v",NULL); CHECK(is_err(r),"SET→ZSET key ERR"); reply_free(r);
 
-/* ─────────────────────────────────────────────────────────
- *  3. KV 없는 키 → NIL
- * ───────────────────────────────────────────────────────── */
-static void test_kv_notfound(ShmHandle *h)
-{
-    SECT("3. KV 없는 키");
-    s_replyObject *r;
-    r = run(h,"GET","ghost",NULL);    CHECK(is_nil(r),"GET ghost →NIL"); reply_free(r);
-    r = run(h,"DEL","ghost",NULL);    CHECK(is_int(r,0),"DEL ghost →0"); reply_free(r);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  4~7. 키 전역 유일 강제
- * ───────────────────────────────────────────────────────── */
-static void test_key_unique(ShmHandle *h)
-{
-    SECT("4. 키 전역 유일 – KV → ZSet 중복");
-    s_replyObject *r;
-    run(h,"SET","dup_kv","v",NULL);
-    r = run(h,"ZCREATE","dup_kv",NULL);
-    CHECK(is_err(r,SHM_ERR_KEY_EXISTS),"KV키로 ZCREATE →KEY_EXISTS"); reply_free(r);
-    r = run(h,"GET","dup_kv",NULL); CHECK(is_str(r,"v"),"KV 무결성 유지"); reply_free(r);
-    run(h,"DEL","dup_kv",NULL);
-
-    SECT("5. 키 전역 유일 – KV → Hash 중복");
-    run(h,"SET","dup_kv2","v2",NULL);
-    r = run(h,"HCREATE","dup_kv2",NULL);
-    CHECK(is_err(r,SHM_ERR_KEY_EXISTS),"KV키로 HCREATE →KEY_EXISTS"); reply_free(r);
-    run(h,"DEL","dup_kv2",NULL);
-
-    SECT("6. 키 전역 유일 – ZSet → KV 중복");
-    run(h,"ZCREATE","dup_zs",NULL);
-    r = run(h,"SET","dup_zs","v",NULL);
-    CHECK(is_err(r,SHM_ERR_KEY_EXISTS),"ZSet이름으로 SET →KEY_EXISTS"); reply_free(r);
-    run(h,"ZADD","dup_zs","1.0","m",NULL);
-    r = run(h,"ZCARD","dup_zs",NULL); CHECK(is_int(r,1),"ZSet 무결성 유지"); reply_free(r);
-//    run(h,"ZDROP","dup_zs",NULL);
-    run(h,"DEL","dup_zs",NULL);
-
-    SECT("7. 키 전역 유일 – Hash → ZSet 중복");
-    run(h,"HCREATE","dup_hh",NULL);
-    run(h,"HSET","dup_hh","f1","v1",NULL);
-    r = run(h,"ZCREATE","dup_hh",NULL);
-    CHECK(is_err(r,SHM_ERR_KEY_EXISTS),"Hash이름으로 ZCREATE →KEY_EXISTS"); reply_free(r);
-    r = run(h,"HEXISTS","dup_hh","f1",NULL); CHECK(is_int(r,1),"Hash 무결성 유지"); reply_free(r);
-//    run(h,"HDROP","dup_hh",NULL);
-    run(h,"DEL","dup_hh",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  8. ZSet ZADD / ZSCORE / ZREM
- * ───────────────────────────────────────────────────────── */
-static void test_zset_basic(ShmHandle *h)
-{
-    SECT("8. ZSet ZADD / ZSCORE / ZREM");
-    s_replyObject *r;
-
-    run(h,"ZCREATE","sc",NULL);
-    r = run(h,"ZADD","sc","1.0","alice",NULL); CHECK(is_int(r,1),"ZADD alice →1"); reply_free(r);
-    r = run(h,"ZADD","sc","2.5","bob",NULL);   CHECK(is_int(r,1),"ZADD bob →1"); reply_free(r);
-    r = run(h,"ZADD","sc","0.5","eve",NULL);   CHECK(is_int(r,1),"ZADD eve →1"); reply_free(r);
-
-    r = run(h,"ZSCORE","sc","alice",NULL); CHECK(r&&fabs(to_dbl(r)-1.0)<1e-9,"ZSCORE alice==1.0"); reply_free(r);
-    r = run(h,"ZSCORE","sc","bob",NULL);   CHECK(r&&fabs(to_dbl(r)-2.5)<1e-9,"ZSCORE bob==2.5"); reply_free(r);
-    r = run(h,"ZSCORE","sc","ghost",NULL); CHECK(is_nil(r),"ZSCORE ghost →NIL"); reply_free(r);
-
-    /* score 갱신 */
-    r = run(h,"ZADD","sc","9.9","alice",NULL); CHECK(is_int(r,0),"ZADD alice 갱신 →0"); reply_free(r);
-    r = run(h,"ZSCORE","sc","alice",NULL); CHECK(r&&fabs(to_dbl(r)-9.9)<1e-9,"ZSCORE alice==9.9"); reply_free(r);
-
-    r = run(h,"ZREM","sc","bob",NULL); CHECK(is_int(r,1),"ZREM bob →1"); reply_free(r);
-    r = run(h,"ZCARD","sc",NULL);      CHECK(is_int(r,2),"ZCARD==2 after ZREM"); reply_free(r);
-    r = run(h,"ZREM","sc","ghost",NULL); CHECK(is_int(r,0),"ZREM ghost →0"); reply_free(r);
-
-//    run(h,"ZDROP","sc",NULL);
-    run(h,"DEL","sc",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  9. ZSet ZADD 플래그
- * ───────────────────────────────────────────────────────── */
-static void test_zset_flags(ShmHandle *h)
-{
-    SECT("9. ZSet ZADD 플래그 NX/XX/GT/LT/CH");
-    s_replyObject *r;
-    run(h,"ZCREATE","fl",NULL);
-    run(h,"ZADD","fl","5.0","m",NULL);
-
-    r = run(h,"ZADD","fl","NX","99.0","m",NULL);  CHECK(is_int(r,0),"NX 이미 있음 →0"); reply_free(r);
-    r = run(h,"ZSCORE","fl","m",NULL); CHECK(r&&fabs(to_dbl(r)-5.0)<1e-9,"NX 후 score 불변"); reply_free(r);
-
-    r = run(h,"ZADD","fl","NX","3.0","newm",NULL); CHECK(is_int(r,1),"NX 없는 멤버 →1"); reply_free(r);
-
-    r = run(h,"ZADD","fl","XX","7.0","ghost",NULL); CHECK(is_int(r,0),"XX 없음 →0"); reply_free(r);
-    r = run(h,"ZSCORE","fl","ghost",NULL); CHECK(is_nil(r),"XX ghost 미생성"); reply_free(r);
-
-    run(h,"ZADD","fl","XX","8.0","m",NULL);
-    r = run(h,"ZSCORE","fl","m",NULL); CHECK(r&&fabs(to_dbl(r)-8.0)<1e-9,"XX 갱신 →8.0"); reply_free(r);
-
-    r = run(h,"ZADD","fl","GT","1.0","m",NULL); CHECK(is_int(r,0),"GT 더 작음 →0"); reply_free(r);
-    r = run(h,"ZSCORE","fl","m",NULL); CHECK(r&&fabs(to_dbl(r)-8.0)<1e-9,"GT 후 불변"); reply_free(r);
-    run(h,"ZADD","fl","GT","20.0","m",NULL);
-    r = run(h,"ZSCORE","fl","m",NULL); CHECK(r&&fabs(to_dbl(r)-20.0)<1e-9,"GT 적용 →20"); reply_free(r);
-
-    r = run(h,"ZADD","fl","LT","99.0","m",NULL); CHECK(is_int(r,0),"LT 더 큰 값 →0"); reply_free(r);
-    run(h,"ZADD","fl","LT","0.1","m",NULL);
-    r = run(h,"ZSCORE","fl","m",NULL); CHECK(r&&fabs(to_dbl(r)-0.1)<1e-9,"LT 적용 →0.1"); reply_free(r);
-
-    r = run(h,"ZADD","fl","CH","42.0","m",NULL); CHECK(is_int(r,1),"CH 변경 →1"); reply_free(r);
-    r = run(h,"ZADD","fl","CH","42.0","m",NULL); CHECK(is_int(r,0),"CH 동일 →0"); reply_free(r);
-
-//    run(h,"ZDROP","fl",NULL);
-    run(h,"DEL","fl",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  10. ZSet ZINCRBY / ZRANK / ZREVRANK / ZCARD / ZCOUNT
- * ───────────────────────────────────────────────────────── */
-static void test_zset_misc(ShmHandle *h)
-{
-    SECT("10. ZSet ZINCRBY / ZRANK / ZREVRANK / ZCARD / ZCOUNT");
-    s_replyObject *r;
-    run(h,"ZCREATE","ms",NULL);
-    run(h,"ZADD","ms","1.0","a",NULL);
-    run(h,"ZADD","ms","2.0","b",NULL);
-    run(h,"ZADD","ms","3.0","c",NULL);
-    run(h,"ZADD","ms","4.0","d",NULL);
-
-    r = run(h,"ZINCRBY","ms","5.0","a",NULL);
-    CHECK(r&&r->type==REPLY_STRING&&fabs(to_dbl(r)-6.0)<1e-9,"ZINCRBY a+5 →6.0"); reply_free(r);
-
-    r = run(h,"ZINCRBY","ms","1.0","new_m",NULL);
-    CHECK(r&&r->type==REPLY_STRING&&fabs(to_dbl(r)-1.0)<1e-9,"ZINCRBY new_m auto-create →1.0"); reply_free(r);
-
-    /* 정렬: new_m=1, b=2, c=3, d=4, a=6 */
-    r = run(h,"ZRANK","ms","new_m",NULL); CHECK(is_int(r,0),"ZRANK new_m==0"); reply_free(r);
-    r = run(h,"ZRANK","ms","b",NULL);     CHECK(is_int(r,1),"ZRANK b==1"); reply_free(r);
-    r = run(h,"ZRANK","ms","ghost",NULL); CHECK(is_nil(r),"ZRANK ghost →NIL"); reply_free(r);
-    r = run(h,"ZREVRANK","ms","a",NULL);  CHECK(is_int(r,0),"ZREVRANK a==0(최대)"); reply_free(r);
-
-    r = run(h,"ZCARD","ms",NULL);         CHECK(is_int(r,5),"ZCARD==5"); reply_free(r);
-    r = run(h,"ZCOUNT","ms","1","4",NULL);CHECK(is_int(r,4),"ZCOUNT [1,4]==4"); reply_free(r);
-    r = run(h,"ZCOUNT","ms","0","100",NULL); CHECK(is_int(r,5),"ZCOUNT [0,100]==5"); reply_free(r);
-
-//    run(h,"ZDROP","ms",NULL);
-    run(h,"DEL","ms",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  11. ZSet ZRANGE / ZRANGEBYSCORE / ZPOPMIN / ZPOPMAX
- * ───────────────────────────────────────────────────────── */
-static void test_zset_range(ShmHandle *h)
-{
-    SECT("11. ZRANGE / ZRANGEBYSCORE / ZPOPMIN / ZPOPMAX");
-    s_replyObject *r;
-    run(h,"ZCREATE","rng",NULL);
-    run(h,"ZADD","rng","1","alpha",NULL);
-    run(h,"ZADD","rng","2","beta",NULL);
-    run(h,"ZADD","rng","3","gamma",NULL);
-    run(h,"ZADD","rng","4","delta",NULL);
-    run(h,"ZADD","rng","5","epsilon",NULL);
-
-    /* ZRANGE ASC 전체 → ARRAY [alpha 1 beta 2 … epsilon 5] */
-    r = run(h,"ZRANGE","rng","0","-1",NULL);
-    CHECK(is_arr(r,10),"ZRANGE ASC 전체 10 원소");
-    if(r&&r->elements>=2) CHECK(!strcmp((char*)r->element[0]->ptr,"alpha"),"첫 멤버==alpha");
-    reply_free(r);
-
-    /* ZRANGE REV */
-    r = run(h,"ZRANGE","rng","0","-1","REV",NULL);
-    CHECK(is_arr(r,10),"ZRANGE REV 10 원소");
-    if(r&&r->elements>=1) CHECK(!strcmp((char*)r->element[0]->ptr,"epsilon"),"REV 첫==epsilon");
-    reply_free(r);
-
-    /* ZRANGE 음수 인덱스 [-2,-1] → delta, epsilon */
-    r = run(h,"ZRANGE","rng","-2","-1",NULL);
-    CHECK(is_arr(r,4),"ZRANGE [-2,-1] 4 원소(delta,epsilon)");
-    if(r&&r->elements>=1) CHECK(!strcmp((char*)r->element[0]->ptr,"delta"),"[-2]==delta");
-    reply_free(r);
-
-    /* ZRANGEBYSCORE [2,4] */
-    r = run(h,"ZRANGEBYSCORE","rng","2","4",NULL);
-    CHECK(is_arr(r,6),"ZRANGEBYSCORE [2,4] 6 원소");
-    reply_free(r);
-
-    /* ZRANGEBYSCORE LIMIT offset=1 count=2 */
-    r = run(h,"ZRANGEBYSCORE","rng","1","5","LIMIT","1","2",NULL);
-    CHECK(is_arr(r,4),"ZRANGEBYSCORE LIMIT(1,2) 4 원소");
-    if(r&&r->elements>=1) CHECK(!strcmp((char*)r->element[0]->ptr,"beta"),"LIMIT[0]==beta");
-    reply_free(r);
-
-    /* ZPOPMIN 2개 */
-    r = run(h,"ZPOPMIN","rng","2",NULL);
-    CHECK(is_arr(r,4),"ZPOPMIN 2 → 4 원소");
-    if(r&&r->elements>=1) CHECK(!strcmp((char*)r->element[0]->ptr,"alpha"),"ZPOPMIN[0]==alpha");
-    reply_free(r);
-    r = run(h,"ZCARD","rng",NULL); CHECK(is_int(r,3),"ZCARD==3 after ZPOPMIN"); reply_free(r);
-
-    /* ZPOPMAX 1개 */
-    r = run(h,"ZPOPMAX","rng","1",NULL);
-    CHECK(is_arr(r,2),"ZPOPMAX 1 → 2 원소");
-    if(r&&r->elements>=1) CHECK(!strcmp((char*)r->element[0]->ptr,"epsilon"),"ZPOPMAX[0]==epsilon");
-    reply_free(r);
-
-//    run(h,"ZDROP","rng",NULL);
-    run(h,"DEL","rng",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  12. Hash HSET / HGET / HDEL / HEXISTS / HLEN
- * ───────────────────────────────────────────────────────── */
-static void test_hash_basic(ShmHandle *h)
-{
-    SECT("12. Hash HSET / HGET / HDEL / HEXISTS / HLEN");
-    s_replyObject *r;
-
-    run(h,"HCREATE","user:1",NULL);
-    r = run(h,"HSET","user:1","name","Alice","age","30","email","a@b.com","score","99.5",NULL);
-    CHECK(is_int(r,4),"HSET 4 신규 →4"); reply_free(r);
-
-    r = run(h,"HSET","user:1","age","31",NULL); CHECK(is_int(r,0),"HSET age 갱신 →0"); reply_free(r);
-
-    r = run(h,"HGET","user:1","name",NULL);  CHECK(is_str(r,"Alice"),"HGET name==Alice"); reply_free(r);
-    r = run(h,"HGET","user:1","age",NULL);   CHECK(is_str(r,"31"),"HGET age==31"); reply_free(r);
-    r = run(h,"HGET","user:1","ghost",NULL); CHECK(is_nil(r),"HGET ghost →NIL"); reply_free(r);
-
-    r = run(h,"HEXISTS","user:1","email",NULL); CHECK(is_int(r,1),"HEXISTS email→1"); reply_free(r);
-    r = run(h,"HEXISTS","user:1","phone",NULL); CHECK(is_int(r,0),"HEXISTS phone→0"); reply_free(r);
-    r = run(h,"HLEN","user:1",NULL);            CHECK(is_int(r,4),"HLEN==4"); reply_free(r);
-
-    r = run(h,"HDEL","user:1","email","score",NULL); CHECK(is_int(r,2),"HDEL 2개 →2"); reply_free(r);
-    r = run(h,"HLEN","user:1",NULL); CHECK(is_int(r,2),"HLEN==2 after HDEL"); reply_free(r);
-    r = run(h,"HDEL","user:1","ghost",NULL); CHECK(is_int(r,0),"HDEL ghost →0"); reply_free(r);
-
-//    run(h,"HDROP","user:1",NULL);
-    run(h,"DEL","user:1",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  13. Hash HGETALL / HKEYS / HVALS
- * ───────────────────────────────────────────────────────── */
-static void test_hash_getall(ShmHandle *h)
-{
-    SECT("13. Hash HGETALL / HKEYS / HVALS");
-    s_replyObject *r;
-    run(h,"HCREATE","item:1",NULL);
-    run(h,"HSET","item:1","color","red","size","L","price","19.99",NULL);
-
-    r = run(h,"HGETALL","item:1",NULL);
-    CHECK(is_arr(r,6),"HGETALL 6 원소 (3쌍)");
-    /* field 와 value 가 교대로 들어있는지 확인 */
-    int found_red=0,found_L=0;
-    if(r&&r->type==REPLY_ARRAY){
-        for(size_t i=0;i+1<r->elements;i+=2){
-            s_replyObject *fobj=r->element[i], *vobj=r->element[i+1];
-            if(fobj&&vobj&&fobj->ptr&&vobj->ptr){
-                if(!strcmp((char*)vobj->ptr,"red")) found_red=1;
-                if(!strcmp((char*)vobj->ptr,"L"))   found_L=1;
-            }
-        }
-    }
-    CHECK(found_red,"HGETALL red 값 존재");
-    CHECK(found_L,"HGETALL L 값 존재");
-    reply_free(r);
-
-    r = run(h,"HKEYS","item:1",NULL); CHECK(is_arr(r,3),"HKEYS 3 원소"); reply_free(r);
-    r = run(h,"HVALS","item:1",NULL); CHECK(is_arr(r,3),"HVALS 3 원소"); reply_free(r);
-
-//    run(h,"HDROP","item:1",NULL);
-    run(h,"DEL","item:1",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  14. Hash HINCRBY / HINCRBYFLOAT
- * ───────────────────────────────────────────────────────── */
-static void test_hash_incr(ShmHandle *h)
-{
-    SECT("14. Hash HINCRBY / HINCRBYFLOAT");
-    s_replyObject *r;
-    run(h,"HCREATE","ctr",NULL);
-
-    r = run(h,"HINCRBY","ctr","hits","10",NULL); CHECK(is_int(r,10),"HINCRBY hits 없음 →10"); reply_free(r);
-    r = run(h,"HINCRBY","ctr","hits","5",NULL);  CHECK(is_int(r,15),"HINCRBY +5 →15"); reply_free(r);
-    r = run(h,"HINCRBY","ctr","hits","-3",NULL); CHECK(is_int(r,12),"HINCRBY -3 →12"); reply_free(r);
-
-    r = run(h,"HINCRBYFLOAT","ctr","rate","1.5",NULL);
-    CHECK(r&&r->type==REPLY_STRING&&fabs(to_dbl(r)-1.5)<1e-9,"HINCRBYFLOAT 없음 →1.5"); reply_free(r);
-    r = run(h,"HINCRBYFLOAT","ctr","rate","0.3",NULL);
-    CHECK(r&&r->type==REPLY_STRING&&fabs(to_dbl(r)-1.8)<1e-9,"HINCRBYFLOAT +0.3 →1.8"); reply_free(r);
-
-//    run(h,"HDROP","ctr",NULL);
-    run(h,"DEL","ctr",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  15. Hash 타입 불일치
- * ───────────────────────────────────────────────────────── */
-static void test_hash_type_mismatch(ShmHandle *h)
-{
-    SECT("15. Hash 타입 불일치");
-    s_replyObject *r;
-    run(h,"SET","kv_only","data",NULL);
-    r = run(h,"HSET","kv_only","f","v",NULL);
-    CHECK(is_err(r,SHM_ERR_KEY_EXISTS),"HSET on KV key →KEY_EXISTS"); reply_free(r);
-    r = run(h,"GET","kv_only",NULL); CHECK(is_str(r,"data"),"KV 무결성 유지"); reply_free(r);
-    run(h,"DEL","kv_only",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  16. Hash 대량 field
- * ───────────────────────────────────────────────────────── */
-#define HBULK 500
-static void test_hash_bulk(ShmHandle *h)
-{
-    SECT("16. Hash 대량 field (500개)");
-    s_replyObject *r;
-    run(h,"HCREATE","bulk_h",NULL);
-
-    int fadd=0, fget=0, fdel=0;
-    for(int i=0;i<HBULK;i++){
-        char fi[32],vi[32];
-        snprintf(fi,sizeof(fi),"field_%04d",i);
-        snprintf(vi,sizeof(vi),"value_%04d",i);
-        r = run(h,"HSET","bulk_h",fi,vi,NULL);
-        if(!r||r->type==REPLY_ERROR) fadd++;
-        reply_free(r);
-    }
-    CHECK(fadd==0,"대량 HSET 전부 성공");
-
-    r = run(h,"HLEN","bulk_h",NULL); CHECK(is_int(r,HBULK),"HLEN==HBULK"); reply_free(r);
-
-    for(int i=0;i<HBULK;i++){
-        char fi[32],vi[32];
-        snprintf(fi,sizeof(fi),"field_%04d",i);
-        snprintf(vi,sizeof(vi),"value_%04d",i);
-        r = run(h,"HGET","bulk_h",fi,NULL);
-        if(!is_str(r,vi)) fget++;
-        reply_free(r);
-    }
-    CHECK(fget==0,"대량 HGET 전부 정확");
-
-    for(int i=0;i<HBULK/2;i++){
-        char fi[32]; snprintf(fi,sizeof(fi),"field_%04d",i);
-        r = run(h,"HDEL","bulk_h",fi,NULL);
-        if(!is_int(r,1)) fdel++;
-        reply_free(r);
-    }
-    CHECK(fdel==0,"절반 HDEL 성공");
-    r = run(h,"HLEN","bulk_h",NULL); CHECK(is_int(r,HBULK-HBULK/2),"HLEN 절반 남음"); reply_free(r);
-
-    run(h,"HDROP","bulk_h",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  17. ZSet DROP 후 재생성
- * ───────────────────────────────────────────────────────── */
-static void test_zdrop_recreate(ShmHandle *h)
-{
-    SECT("17. ZSet DROP 후 재생성");
-    s_replyObject *r;
-    run(h,"ZCREATE","tmp_z",NULL);
-    run(h,"ZADD","tmp_z","1.0","x",NULL);
-    run(h,"ZADD","tmp_z","2.0","y",NULL);
-
-    r = run(h,"ZDROP","tmp_z",NULL); CHECK(is_ok(r),"ZDROP 성공"); reply_free(r);
-    r = run(h,"ZCARD","tmp_z",NULL); CHECK(is_int(r,0),"ZCARD==0 after DROP"); reply_free(r);
-    r = run(h,"ZDROP","tmp_z",NULL); CHECK(is_err(r,SHM_ERR_NOT_FOUND),"재DROP →NOT_FOUND"); reply_free(r);
-
-    r = run(h,"ZCREATE","tmp_z",NULL); CHECK(is_ok(r),"재생성 OK"); reply_free(r);
-    r = run(h,"ZADD","tmp_z","9.9","a",NULL); CHECK(is_int(r,1),"재생성 후 ZADD →1"); reply_free(r);
-    run(h,"ZDROP","tmp_z",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  18. cmd_table_get – 커맨드 테이블
- * ───────────────────────────────────────────────────────── */
-static void test_cmd_table(ShmHandle *h)
-{
-    SECT("18. cmd_table_get");
-    (void)h;
-    size_t cnt = 0;
-    const CmdEntry *tbl = cmd_table_get(&cnt);
-    CHECK(cnt >= 28, "커맨드 수 >= 28");
-    printf("  등록된 커맨드 (%zu개):\n", cnt);
-    for (size_t i = 0; i < cnt; i++)
-        printf("    %-18s  %s\n", tbl[i].name, tbl[i].usage);
-
-    /* 알 수 없는 커맨드 */
-    s_replyObject *r = run(h,"UNKNOWN_CMD","arg",NULL);
-    CHECK(r&&r->type==REPLY_ERROR,"알 수 없는 커맨드 →ERROR"); reply_free(r);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  19. reply_print 시각 확인
- * ───────────────────────────────────────────────────────── */
-static void test_reply_print(ShmHandle *h)
-{
-    SECT("19. reply_print 출력 검증");
-    s_replyObject *r;
-
-    run(h,"HCREATE","demo",NULL);
-    run(h,"HSET","demo","name","Claude","version","5","type","AI",NULL);
-    r = run(h,"HGETALL","demo",NULL);
-    printf("  HGETALL demo:\n"); reply_print(r, 4);
-    CHECK(r&&r->type==REPLY_ARRAY,"HGETALL 반환 타입 ARRAY"); reply_free(r);
-
-    run(h,"ZCREATE","demo_z",NULL);
-    run(h,"ZADD","demo_z","3.14","pi",NULL);
-    run(h,"ZADD","demo_z","2.72","e",NULL);
-    r = run(h,"ZRANGE","demo_z","0","-1",NULL);
-    printf("  ZRANGE demo_z:\n"); reply_print(r, 4);
-    CHECK(r&&r->type==REPLY_ARRAY,"ZRANGE 반환 타입 ARRAY"); reply_free(r);
-
-    run(h,"HDROP","demo",NULL);
-    run(h,"ZDROP","demo_z",NULL);
-}
-
-/* ─────────────────────────────────────────────────────────
- *  20. 멀티프로세스 동시 SET + HSET + ZADD
- * ───────────────────────────────────────────────────────── */
-#define MP_PROC  12
-#define MP_KV    80
-#define MP_HF    80
-#define MP_ZA    80
-
-static void test_multiproc(void)
-{
-    SECT("20. 멀티프로세스 동시 SET + HSET + ZADD");
-    {
-        ShmHandle *p = shm_open_existing(SHM_TEST);
-        if (!p) { printf(FAIL " open 실패\n"); g_fail++; return; }
-        run(p,"ZCREATE","mp_zs",NULL);
-        run(p,"HCREATE","mp_hh",NULL);
-        shm_close(p);
-    }
-    pid_t pids[MP_PROC];
-    for (int p = 0; p < MP_PROC; p++) {
-        pids[p] = fork();
-        if (pids[p] == 0) {
-            ShmHandle *ch = shm_open_existing(SHM_TEST);
-            if (!ch) exit(1);
-            shm_set_debug_level(DBG_ERROR);
-            for (int i = 0; i < MP_KV; i++) {
-                char k[32],v[32]; snprintf(k,sizeof(k),"kv_p%d_%03d",p,i); snprintf(v,sizeof(v),"val_p%d_%03d",p,i);
-                s_replyObject *r = run(ch,"SET",k,v,NULL); reply_free(r);
-            }
-            for (int i = 0; i < MP_HF; i++) {
-                char f[32],v[32]; snprintf(f,sizeof(f),"f_p%d_%03d",p,i); snprintf(v,sizeof(v),"v_p%d_%03d",p,i);
-                s_replyObject *r = run(ch,"HSET","mp_hh",f,v,NULL); reply_free(r);
-            }
-            for (int i = 0; i < MP_ZA; i++) {
-                char sc[32],m[32]; snprintf(sc,sizeof(sc),"%d",p*10000+i); snprintf(m,sizeof(m),"m_p%d_%03d",p,i);
-                s_replyObject *r = run(ch,"ZADD","mp_zs",sc,m,NULL); reply_free(r);
-            }
-            shm_close(ch); exit(0);
-        }
-    }
-    int all_ok = 1;
-    for (int p = 0; p < MP_PROC; p++) {
-        int st; waitpid(pids[p], &st, 0);
-        if (!WIFEXITED(st) || WEXITSTATUS(st)) all_ok = 0;
-    }
-    CHECK(all_ok, "모든 자식 정상 종료");
-
-    ShmHandle *h = shm_open_existing(SHM_TEST);
-    if (!h) { printf(FAIL " 검증 open 실패\n"); g_fail++; return; }
-    shm_set_debug_level(DBG_ERROR);
-
-    int mk=0, mh=0, mz=0;
-    for (int p=0;p<MP_PROC;p++) for (int i=0;i<MP_KV;i++){
-        char k[32],v[32]; snprintf(k,sizeof(k),"kv_p%d_%03d",p,i); snprintf(v,sizeof(v),"val_p%d_%03d",p,i);
-        s_replyObject *r = run(h,"GET",k,NULL); if(!is_str(r,v)) mk++; reply_free(r);
-    }
-    CHECK(mk==0,"mp KV 모든 값 정확");
-
-    s_replyObject *hl = run(h,"HLEN","mp_hh",NULL);
-    CHECK(is_int(hl,(int64_t)(MP_PROC*MP_HF)),"mp HLEN==MP_PROC*MP_HF"); reply_free(hl);
-    for (int p=0;p<MP_PROC;p++) for (int i=0;i<MP_HF;i++){
-        char f[32],v[32]; snprintf(f,sizeof(f),"f_p%d_%03d",p,i); snprintf(v,sizeof(v),"v_p%d_%03d",p,i);
-        s_replyObject *r = run(h,"HGET","mp_hh",f,NULL); if(!is_str(r,v)) mh++; reply_free(r);
-    }
-    CHECK(mh==0,"mp Hash 모든 field 정확");
-
-    s_replyObject *zc = run(h,"ZCARD","mp_zs",NULL);
-    CHECK(is_int(zc,(int64_t)(MP_PROC*MP_ZA)),"mp ZCARD==MP_PROC*MP_ZA"); reply_free(zc);
-    for (int p=0;p<MP_PROC;p++) for (int i=0;i<MP_ZA;i++){
-        char m[32]; snprintf(m,sizeof(m),"m_p%d_%03d",p,i);
-        s_replyObject *r = run(h,"ZSCORE","mp_zs",m,NULL);
-        if(!r||r->type==REPLY_NIL) mz++;
-        else if(r->type==REPLY_STRING&&fabs(to_dbl(r)-(double)(p*10000+i))>1e-6) mz++;
-        reply_free(r);
-    }
-    CHECK(mz==0,"mp ZSet 모든 score 정확");
-
-    /* 정리 */
-    run(h,"ZDROP","mp_zs",NULL); run(h,"HDROP","mp_hh",NULL);
-//    run(h,"DEL","mp_zs",NULL); run(h,"DEL","mp_hh",NULL);
-    for(int p=0;p<MP_PROC;p++) for(int i=0;i<MP_KV;i++){
-        char k[32]; snprintf(k,sizeof(k),"kv_p%d_%03d",p,i); run(h,"DEL",k,NULL);
-    }
-    shm_close(h);
-}
-
-#if 0
-/* ── 응답 타입 / 값 검사 헬퍼 ───────────────────────────── */
-static int reply_is_ok(s_replyObject *r)
-    { return r && r->type == REPLY_STATUS && strcmp((char*)r->ptr,"OK")==0; }
-static int reply_is_int(s_replyObject *r, int64_t v)
-    { return r && r->type == REPLY_INTEGER && r->integer == v; }
-#if 0
-static int reply_is_str(s_replyObject *r, const char *s)
-    { return r && r->type == REPLY_STRING && strcmp((char*)r->ptr,s)==0; }
-#endif
-static int reply_is_nil(s_replyObject *r)
-    { return r && r->type == REPLY_NIL; }
-static int reply_is_err(s_replyObject *r)
-    { return r && r->type == REPLY_ERROR; }
-static int reply_arr_len(s_replyObject *r, size_t n)
-    { return r && r->type == REPLY_ARRAY && r->elements == n; }
-/* ARRAY 내 i 번째 원소가 문자열 s 인지 */
-static int reply_arr_elem_str(s_replyObject *r, size_t i, const char *s)
-    { return r && r->type==REPLY_ARRAY && i<r->elements
-             && r->element[i] && r->element[i]->type==REPLY_STRING
-             && strcmp((char*)r->element[i]->ptr, s)==0; }
-#endif
-static void test_mset_mget(ShmHandle *h)
-{
-    SECT("KV - MSET / MGET");
-    s_replyObject *r;
-
-    r = run(h, "MSET", "k1", "v1", "k2", "v2", "k3", "v3", NULL);
-    CHECK(is_ok(r), "MSET 성공");
-    reply_free(r);
-
-    r = run(h, "MGET", "k1", "k2", "k3", "ghost", NULL);
-    CHECK(is_arr(r, 4), "MGET 4개 키");
-    if (r && r->elements >= 4) {
-        CHECK(is_str(r->element[0], "v1"), "MGET k1");
-        CHECK(is_str(r->element[1], "v2"), "MGET k2");
-        CHECK(is_str(r->element[2], "v3"), "MGET k3");
-        CHECK(is_nil(r->element[3]), "MGET ghost → NIL");
-    }
-    reply_free(r);
-
-    run(h, "DEL", "k1", "k2", "k3", NULL);
+    /* 인자 부족 */
+    r=run(h,"SET","k",NULL); CHECK(is_err(r),"SET 인자부족→ERR"); reply_free(r);
 }
 
 /* ============================================================
- *  21. Redis Set 명령어 테스트 (Robust)
+ *  §02  KEYS
  * ============================================================ */
-static void test_set(ShmHandle *h)
+static void t02_keys(ShmHandle *h)
 {
-    SECT("21. Redis Set 명령어 테스트");
+    SECT("02. KEYS – 패턴 매칭 [FIX: 버킷 mutex 보호]");
     s_replyObject *r;
 
-    /* SCREATE */
-    r = run(h, "SCREATE", "myset", NULL);
-    CHECK(is_ok(r), "SCREATE myset");
+    run(h,"SET","key:a","1",NULL);
+    run(h,"SET","key:b","2",NULL);
+    run(h,"SET","other","3",NULL);
+
+    r=run(h,"KEYS","key:*",NULL);
+    CHECK(r&&r->type==REPLY_ARRAY, "KEYS key:* → ARRAY");
+    CHECK(arr_has(r,"key:a"), "KEYS 포함 key:a");
+    CHECK(arr_has(r,"key:b"), "KEYS 포함 key:b");
+    CHECK(!arr_has(r,"other"),"KEYS 미포함 other");
     reply_free(r);
 
-    /* SADD */
-    r = run(h, "SADD", "myset", "apple", "banana", "cherry", "apple", NULL);
-    CHECK(is_int(r, 3), "SADD 3개 멤버 (중복 제외)");
-    reply_free(r);
+    r=run(h,"KEYS","*",NULL);
+    CHECK(r&&r->type==REPLY_ARRAY&&r->elements>=3,"KEYS * ≥ 3개"); reply_free(r);
 
-    r = run(h, "SCARD", "myset", NULL);
-    CHECK(is_int(r, 3), "SCARD == 3");
-    reply_free(r);
+    r=run(h,"KEYS","none_match_xyz",NULL);
+    CHECK(arr_sz(r,0),"KEYS 미매칭→0"); reply_free(r);
 
-    /* SISMEMBER */
-    r = run(h, "SISMEMBER", "myset", "banana", NULL);
-    CHECK(is_int(r, 1), "SISMEMBER banana");
-    reply_free(r);
-
-    /* SREM */
-    r = run(h, "SREM", "myset", "banana", "grape", NULL);
-    CHECK(is_int(r, 1), "SREM banana → 1");
-    reply_free(r);
-
-    r = run(h, "SCARD", "myset", NULL);
-    CHECK(is_int(r, 2), "SREM 후 SCARD == 2");
-    reply_free(r);
-
-    /* SPOP count=1 */
-    r = run(h, "SPOP", "myset", NULL);
-    CHECK(is_arr(r, 1) || r->type == REPLY_STRING, "SPOP 1개 반환");
-    reply_free(r);
-
-    r = run(h, "SCARD", "myset", NULL);
-    CHECK(is_int(r, 1), "SPOP 후 SCARD == 1");
-    reply_free(r);
-
-    /* SPOP count=2 (남은 멤버 1개) */
-    r = run(h, "SPOP", "myset", "2", NULL);
-    CHECK(is_arr(r, 1), "SPOP count=2 → 실제 1개만 반환");
-    reply_free(r);
-
-    r = run(h, "SCARD", "myset", NULL);
-    CHECK(is_int(r, 0), "SPOP 후 SCARD == 0");
-    reply_free(r);
-
-    /* SRANDMEMBER */
-    r = run(h, "SRANDMEMBER", "myset", NULL);           // count 없음
-    CHECK(r && (r->type == REPLY_STRING || r->type == REPLY_NIL),
-          "SRANDMEMBER (단일) 정상");
-    reply_free(r);
-
-    /* 재생성 후 SRANDMEMBER count 테스트 */
-    run(h, "SADD", "myset2", "x", "y", "z", NULL);
-    r = run(h, "SRANDMEMBER", "myset2", "2", NULL);
-    CHECK(is_arr(r, 2), "SRANDMEMBER count=2");
-    reply_free(r);
-
-    run(h, "SDROP", "myset", NULL);
-    run(h, "SDROP", "myset2", NULL);
-
-    printf(PASS " Set 명령어 전체 테스트 완료\n");
+    /* 인자 부족 */
+    r=run(h,"KEYS",NULL); CHECK(is_err(r),"KEYS 인자없음→ERR [FIX-2]"); reply_free(r);
 }
 
-/* ─────────────────────────────────────────────────────────
- *  main
- * ───────────────────────────────────────────────────────── */
-int main(int argc, char *argv[])
+/* ============================================================
+ *  §03  DEL 라우팅
+ * ============================================================ */
+static void t03_del(ShmHandle *h)
 {
-	if (argc > 1 && argv[1][0] == 'v')	{
-		ShmHandle *h = shm_open_existing(SHM_TEST);
-		if (h) {
-			shm_dump_stats(h);
-			shm_close(h);
-		}
-		return 0;
-	}
-	printf("==========================================\n");
-    printf("  SHM v5  –  s_replyObject 통합 테스트\n");
-    printf("==========================================\n");
+    SECT("03. DEL – 타입별 라우팅 / 혼합 / 없는키 / 중복");
+    s_replyObject *r;
 
-    shm_set_debug_level(DBG_INFO);
-    shm_destroy(SHM_TEST);
+    run(h,"SET",  "dkv","v",          NULL);
+    run(h,"ZADD", "dzs","1","m",       NULL);
+    run(h,"HSET", "dhs","f","v",       NULL);
 
-    ShmHandle *h = shm_create(SHM_TEST, 1ULL << 30);
-    if (!h) { fprintf(stderr, "shm_create 실패\n"); return 1; }
+    /* DEL KV */
+    r=run(h,"DEL","dkv",NULL);
+    CHECK(is_int(r,1),"DEL KV→1"); reply_free(r);
+    r=run(h,"GET","dkv",NULL); CHECK(is_nil(r),"DEL 후 GET→NIL"); reply_free(r);
 
-    test_kv_basic(h);
-    test_kv_update(h);
-    test_kv_notfound(h);
-    test_mset_mget(h);
-    test_key_unique(h);
-    test_zset_basic(h);
-    test_zset_flags(h);
-    test_zset_misc(h);
-    test_zset_range(h);
-    test_hash_basic(h);
-    test_hash_getall(h);
-    test_hash_incr(h);
-    test_hash_type_mismatch(h);
-    shm_set_debug_level(DBG_ERROR);
-    test_hash_bulk(h);
-    shm_set_debug_level(DBG_INFO);
-    test_zdrop_recreate(h);
-    test_cmd_table(h);
-    test_reply_print(h);
-    test_set(h);
+    /* DEL ZSET */
+    r=run(h,"DEL","dzs",NULL);
+    CHECK(is_int(r,1),"DEL ZSET→1"); reply_free(r);
+    r=run(h,"ZCARD","dzs",NULL); CHECK(is_int(r,0),"DEL 후 ZCARD=0"); reply_free(r);
 
+    /* DEL HASH */
+    r=run(h,"DEL","dhs",NULL);
+    CHECK(is_int(r,1),"DEL HASH→1"); reply_free(r);
+    r=run(h,"HLEN","dhs",NULL); CHECK(is_int(r,0),"DEL 후 HLEN=0"); reply_free(r);
 
-    shm_dump_stats(h);
+    /* 혼합 */
+    run(h,"SET","mk","v",NULL); run(h,"ZADD","mz","1","a",NULL); run(h,"HSET","mh","f","v",NULL);
+    r=run(h,"DEL","mk","mz","mh",NULL);
+    CHECK(is_int(r,3),"DEL 혼합 3→3"); reply_free(r);
+
+    /* 없는 키 */
+    r=run(h,"DEL","nokey",NULL); CHECK(is_int(r,0),"DEL 없는키→0"); reply_free(r);
+
+    /* 중복 키 */
+    run(h,"SET","dup","v",NULL);
+    r=run(h,"DEL","dup","dup",NULL);
+    CHECK(is_int(r,1),"DEL 중복→1(두번째없음)"); reply_free(r);
+
+    /* 라우팅 테이블 항목 */
+    size_t cnt=0; del_route_table_get(&cnt);
+    CHECK(cnt>=3,"라우팅 테이블 ≥ 3항목");
+
+    /* DEL 후 재생성 (KV→ZSET→HASH 순환) */
+    run(h,"SET","reuse","kv",NULL);
+    run(h,"DEL","reuse",NULL);
+    r=run(h,"ZADD","reuse","10","m",NULL); CHECK(r&&r->type==REPLY_INTEGER,"재생성 ZADD"); reply_free(r);
+    run(h,"DEL","reuse",NULL);
+    r=run(h,"HSET","reuse","f","v",NULL);  CHECK(r&&r->type==REPLY_INTEGER,"재생성 HSET"); reply_free(r);
+    run(h,"DEL","reuse",NULL);
+}
+
+/* ============================================================
+ *  §04  ZSET
+ * ============================================================ */
+static void t04_zset(ShmHandle *h)
+{
+    SECT("04. ZSET");
+    s_replyObject *r;
+
+    /* ZCREATE / ZDROP */
+    r=run(h,"ZCREATE","z1",NULL); CHECK(is_ok(r),"ZCREATE→OK"); reply_free(r);
+    r=run(h,"ZDROP",  "z1",NULL); CHECK(is_ok(r),"ZDROP→OK");   reply_free(r);
+    r=run(h,"ZDROP",  "z1",NULL); CHECK(is_err(r),"ZDROP 없는→ERR"); reply_free(r);
+
+    /* ZADD 기본 */
+    r=run(h,"ZADD","zs","100","Alice",NULL); CHECK(is_int(r,1),"ZADD Alice→1"); reply_free(r);
+    r=run(h,"ZADD","zs","200","Bob",  NULL); CHECK(is_int(r,1),"ZADD Bob→1");   reply_free(r);
+    r=run(h,"ZADD","zs","150","Carol",NULL); CHECK(is_int(r,1),"ZADD Carol→1"); reply_free(r);
+
+    /* ZCARD */
+    r=run(h,"ZCARD","zs",NULL); CHECK(is_int(r,3),"ZCARD=3"); reply_free(r);
+
+    /* ZSCORE */
+    r=run(h,"ZSCORE","zs","Alice",NULL);
+    CHECK(r&&r->type==REPLY_STRING&&fabs(atof((char*)r->ptr)-100.0)<1e-9,"ZSCORE Alice=100"); reply_free(r);
+    r=run(h,"ZSCORE","zs","noone",NULL); CHECK(is_nil(r),"ZSCORE 없음→NIL"); reply_free(r);
+
+    /* ZRANK / ZREVRANK (Alice<Carol<Bob) */
+    r=run(h,"ZRANK",   "zs","Alice",NULL); CHECK(is_int(r,0),"ZRANK Alice=0");    reply_free(r);
+    r=run(h,"ZRANK",   "zs","Bob",  NULL); CHECK(is_int(r,2),"ZRANK Bob=2");      reply_free(r);
+    r=run(h,"ZREVRANK","zs","Alice",NULL); CHECK(is_int(r,2),"ZREVRANK Alice=2"); reply_free(r);
+    r=run(h,"ZRANK",   "zs","x",    NULL); CHECK(is_nil(r),"ZRANK 없음→NIL");    reply_free(r);
+
+    /* ZCOUNT */
+    r=run(h,"ZCOUNT","zs","100","200",NULL); CHECK(is_int(r,3),"ZCOUNT 100~200=3"); reply_free(r);
+    r=run(h,"ZCOUNT","zs","100","149",NULL); CHECK(is_int(r,1),"ZCOUNT 100~149=1"); reply_free(r);
+
+    /* ZRANGE */
+    r=run(h,"ZRANGE","zs","0","2",NULL);
+    CHECK(arr_sz(r,6),"ZRANGE 0 2 크기=6");
+    CHECK(r&&r->elements>=1&&r->element[0]&&strcmp((char*)r->element[0]->ptr,"Alice")==0,"ZRANGE[0]=Alice");
+    reply_free(r);
+
+    r=run(h,"ZRANGE","zs","0","2","REV",NULL);
+    CHECK(r&&r->type==REPLY_ARRAY&&r->elements>=1
+          &&strcmp((char*)r->element[0]->ptr,"Bob")==0,"ZRANGE REV[0]=Bob");
+    reply_free(r);
+
+    /* 음수 인덱스 */
+    r=run(h,"ZRANGE","zs","-1","-1",NULL);
+    CHECK(r&&r->type==REPLY_ARRAY&&r->elements==2
+          &&strcmp((char*)r->element[0]->ptr,"Bob")==0,"ZRANGE -1-1=Bob");
+    reply_free(r);
+
+    /* ZRANGEBYSCORE */
+    r=run(h,"ZRANGEBYSCORE","zs","100","150",NULL);
+    CHECK(arr_sz(r,4),"ZRANGEBYSCORE 100~150=4"); reply_free(r);
+    r=run(h,"ZRANGEBYSCORE","zs","100","200","LIMIT","0","2",NULL);
+    CHECK(arr_sz(r,4),"ZRANGEBYSCORE LIMIT 2=4"); reply_free(r);
+
+    /* NX: 있으면 무시 */
+    r=run(h,"ZADD","zs","NX","999","Alice",NULL);
+    CHECK(is_int(r,0),"ZADD NX 기존→0"); reply_free(r);
+    r=run(h,"ZSCORE","zs","Alice",NULL);
+    CHECK(r&&fabs(atof((char*)r->ptr)-100.0)<1e-9,"NX 후 score 변경없음"); reply_free(r);
+
+    /* XX: 없으면 무시 */
+    r=run(h,"ZADD","zs","XX","999","NewMember",NULL);
+    CHECK(is_int(r,0),"ZADD XX 없는→0"); reply_free(r);
+    r=run(h,"ZCARD","zs",NULL); CHECK(is_int(r,3),"XX 후 ZCARD=3"); reply_free(r);
+
+    /* GT: score 가 클 때만 갱신 */
+    r=run(h,"ZADD","zs","GT","50","Alice",NULL);  /* 50 < 100 → 무시 */
+    CHECK(is_int(r,0),"ZADD GT 더작으면→0"); reply_free(r);
+    r=run(h,"ZADD","zs","GT","300","Alice",NULL); /* 300 > 100 → 갱신 */
+    CHECK(is_int(r,0),"ZADD GT 더크면 changed=0(CH없음)"); reply_free(r);
+    r=run(h,"ZSCORE","zs","Alice",NULL);
+    CHECK(r&&fabs(atof((char*)r->ptr)-300.0)<1e-9,"GT 후 score=300"); reply_free(r);
+
+    /* CH 플래그 */
+    r=run(h,"ZADD","zs","CH","500","Alice",NULL);
+    CHECK(is_int(r,1),"ZADD CH 변경→1"); reply_free(r);
+
+    /* ZINCRBY [FIX-1: TOCTOU 없음] */
+    r=run(h,"ZINCRBY","zs","10","Bob",NULL);
+    CHECK(r&&r->type==REPLY_STRING&&fabs(atof((char*)r->ptr)-210.0)<1e-9,"ZINCRBY Bob=210"); reply_free(r);
+
+    /* ZREM */
+    r=run(h,"ZREM","zs","Carol",NULL); CHECK(is_int(r,1),"ZREM Carol→1"); reply_free(r);
+    r=run(h,"ZCARD","zs",NULL);        CHECK(is_int(r,2),"ZREM 후 ZCARD=2"); reply_free(r);
+
+    /* ZPOPMIN / ZPOPMAX */
+    run(h,"ZADD","zpk","1","a","2","b","3","c",NULL);
+    r=run(h,"ZPOPMIN","zpk",NULL);
+    CHECK(arr_sz(r,2)&&r->element[0]&&strcmp((char*)r->element[0]->ptr,"a")==0,"ZPOPMIN=a"); reply_free(r);
+    r=run(h,"ZPOPMAX","zpk","2",NULL);
+    CHECK(arr_sz(r,4)&&r->element[0]&&strcmp((char*)r->element[0]->ptr,"c")==0,"ZPOPMAX 2: c 먼저"); reply_free(r);
+    r=run(h,"ZCARD","zpk",NULL); CHECK(is_int(r,0),"ZPOPMAX 후 ZCARD=0"); reply_free(r);
+}
+
+/* ============================================================
+ *  §05  HASH
+ * ============================================================ */
+static void t05_hash(ShmHandle *h)
+{
+    SECT("05. HASH");
+    s_replyObject *r;
+
+    /* HCREATE / HDROP */
+    r=run(h,"HCREATE","h1",NULL); CHECK(is_ok(r),"HCREATE→OK"); reply_free(r);
+    r=run(h,"HDROP",  "h1",NULL); CHECK(is_ok(r),"HDROP→OK");   reply_free(r);
+    r=run(h,"HDROP",  "h1",NULL); CHECK(is_err(r),"HDROP 없는→ERR"); reply_free(r);
+
+    /* HSET 멀티 */
+    r=run(h,"HSET","user","name","Alice","age","30","city","Seoul",NULL);
+    CHECK(is_int(r,3),"HSET 3 field→3"); reply_free(r);
+
+    /* HGET */
+    r=run(h,"HGET","user","name",NULL); CHECK(is_str(r,"Alice"),"HGET name=Alice"); reply_free(r);
+    r=run(h,"HGET","user","age", NULL); CHECK(is_str(r,"30"),   "HGET age=30");     reply_free(r);
+    r=run(h,"HGET","user","nope",NULL); CHECK(is_nil(r),"HGET 없는field→NIL");      reply_free(r);
+
+    /* HSET 갱신 */
+    r=run(h,"HSET","user","name","Bob",NULL);
+    CHECK(is_int(r,0),"HSET 갱신→0"); reply_free(r);
+    r=run(h,"HGET","user","name",NULL); CHECK(is_str(r,"Bob"),"HGET 갱신=Bob"); reply_free(r);
+
+    /* HLEN [FIX-4: mutex 보호] */
+    r=run(h,"HLEN","user",NULL); CHECK(is_int(r,3),"HLEN=3"); reply_free(r);
+
+    /* HEXISTS */
+    r=run(h,"HEXISTS","user","age",  NULL); CHECK(is_int(r,1),"HEXISTS age=1");  reply_free(r);
+    r=run(h,"HEXISTS","user","nope", NULL); CHECK(is_int(r,0),"HEXISTS nope=0"); reply_free(r);
+
+    /* HDEL */
+    r=run(h,"HDEL","user","age","city",NULL); CHECK(is_int(r,2),"HDEL 2→2"); reply_free(r);
+    r=run(h,"HLEN","user",NULL);              CHECK(is_int(r,1),"HDEL 후 HLEN=1"); reply_free(r);
+
+    /* HGETALL / HKEYS / HVALS [FIX-5: cap 조정] */
+    run(h,"HSET","hh","f1","v1","f2","v2","f3","v3",NULL);
+    r=run(h,"HGETALL","hh",NULL); CHECK(arr_sz(r,6),"HGETALL=6"); reply_free(r);
+    r=run(h,"HKEYS",  "hh",NULL); CHECK(arr_sz(r,3),"HKEYS=3");   reply_free(r);
+    r=run(h,"HVALS",  "hh",NULL); CHECK(arr_sz(r,3),"HVALS=3");   reply_free(r);
+
+    /* HINCRBY */
+    run(h,"HSET","cnt","n","10",NULL);
+    r=run(h,"HINCRBY","cnt","n","5",NULL); CHECK(is_int(r,15),"HINCRBY 10+5=15"); reply_free(r);
+    r=run(h,"HINCRBY","cnt","n","-3",NULL); CHECK(is_int(r,12),"HINCRBY 15-3=12"); reply_free(r);
+
+    /* HINCRBYFLOAT */
+    run(h,"HSET","flt","x","1.5",NULL);
+    r=run(h,"HINCRBYFLOAT","flt","x","0.5",NULL);
+    CHECK(r&&r->type==REPLY_STRING&&fabs(atof((char*)r->ptr)-2.0)<1e-9,"HINCRBYFLOAT=2.0"); reply_free(r);
+
+    /* 타입 충돌 */
+    r=run(h,"HSET","ztype","f","v",NULL); CHECK(is_err(r),"HSET→ZSET key ERR"); reply_free(r);
+}
+
+/* ============================================================
+ *  §06  직렬화(serialize) 검증 – 멀티스레드
+ * ============================================================ */
+#define MT_THREADS   8
+#define MT_OPS_PER   200
+
+typedef struct { ShmHandle *h; int id; } MtArg;
+
+/* bucket_mutex: 동일 버킷에 동시 SET */
+static void *mt_kv_worker(void *arg)
+{
+    MtArg *a = (MtArg *)arg;
+    char k[32], v[32];
+    for (int i = 0; i < MT_OPS_PER; i++) {
+        snprintf(k, sizeof(k), "mt_kv_%d_%d", a->id, i);
+        snprintf(v, sizeof(v), "val_%d_%d",   a->id, i);
+        string_t sk={k,(uint32_t)strlen(k)}, sv={v,(uint32_t)strlen(v)};
+        string_t sc={"SET",3};
+        string_t *args[]={&sc,&sk,&sv};
+        s_replyObject *r = cmd_dispatch(a->h, args, 3);
+        reply_free(r);
+    }
+    return NULL;
+}
+
+/* zset_mutex: 동시 ZADD */
+static void *mt_zset_worker(void *arg)
+{
+    MtArg *a = (MtArg *)arg;
+    char m[32], sc[16];
+    for (int i = 0; i < MT_OPS_PER; i++) {
+        snprintf(m,  sizeof(m),  "mt_m_%d_%d", a->id, i);
+        snprintf(sc, sizeof(sc), "%d", a->id * 1000 + i);
+        string_t sk={"mt_zset",7}, ss={sc,(uint32_t)strlen(sc)}, sm={m,(uint32_t)strlen(m)};
+        string_t scmd={"ZADD",4};
+        string_t *args[]={&scmd,&sk,&ss,&sm};
+        s_replyObject *r = cmd_dispatch(a->h, args, 4);
+        reply_free(r);
+    }
+    return NULL;
+}
+
+/* hash_mutex: 동시 HSET */
+static void *mt_hash_worker(void *arg)
+{
+    MtArg *a = (MtArg *)arg;
+    char f[32], v[32];
+    for (int i = 0; i < MT_OPS_PER; i++) {
+        snprintf(f, sizeof(f), "f_%d_%d", a->id, i);
+        snprintf(v, sizeof(v), "v_%d_%d", a->id, i);
+        string_t sk={"mt_hash",7}, sf={f,(uint32_t)strlen(f)}, sv2={v,(uint32_t)strlen(v)};
+        string_t scmd={"HSET",4};
+        string_t *args[]={&scmd,&sk,&sf,&sv2};
+        s_replyObject *r = cmd_dispatch(a->h, args, 4);
+        reply_free(r);
+    }
+    return NULL;
+}
+
+static void t06_serialize(ShmHandle *h)
+{
+    SECT("06. 직렬화 검증 (멀티스레드)");
+    pthread_t tids[MT_THREADS];
+    MtArg     args[MT_THREADS];
+
+    /* bucket_mutex: MT_THREADS × MT_OPS_PER KV SET → 전체 키 존재 확인 */
+    for (int i = 0; i < MT_THREADS; i++) {
+        args[i].h = h; args[i].id = i;
+        pthread_create(&tids[i], NULL, mt_kv_worker, &args[i]);
+    }
+    for (int i = 0; i < MT_THREADS; i++) pthread_join(tids[i], NULL);
+
+    int kv_ok = 1;
+    for (int i = 0; i < MT_THREADS && kv_ok; i++) {
+        for (int j = 0; j < MT_OPS_PER && kv_ok; j++) {
+            char k[32]; snprintf(k, sizeof(k), "mt_kv_%d_%d", i, j);
+            string_t sk={k,(uint32_t)strlen(k)}, sc={"GET",3};
+            string_t *a[]={&sc,&sk};
+            s_replyObject *r = cmd_dispatch(h, a, 2);
+            if (!r || r->type != REPLY_STRING) kv_ok = 0;
+            reply_free(r);
+        }
+    }
+    CHECK(kv_ok, "bucket_mutex: 동시 SET 모두 저장됨");
+
+    /* zset_mutex: MT_THREADS × MT_OPS_PER ZADD → ZCARD 정확 */
+    for (int i = 0; i < MT_THREADS; i++) {
+        args[i].h = h; args[i].id = i;
+        pthread_create(&tids[i], NULL, mt_zset_worker, &args[i]);
+    }
+    for (int i = 0; i < MT_THREADS; i++) pthread_join(tids[i], NULL);
+    s_replyObject *r = run(h, "ZCARD", "mt_zset", NULL);
+    CHECK(is_int(r, (int64_t)(MT_THREADS * MT_OPS_PER)),
+          "zset_mutex: ZCARD = 스레드×ops");
+    reply_free(r);
+
+    /* hash_mutex: MT_THREADS × MT_OPS_PER HSET → HLEN 정확 */
+    for (int i = 0; i < MT_THREADS; i++) {
+        args[i].h = h; args[i].id = i;
+        pthread_create(&tids[i], NULL, mt_hash_worker, &args[i]);
+    }
+    for (int i = 0; i < MT_THREADS; i++) pthread_join(tids[i], NULL);
+    r = run(h, "HLEN", "mt_hash", NULL);
+    CHECK(is_int(r, (int64_t)(MT_THREADS * MT_OPS_PER)),
+          "hash_mutex: HLEN = 스레드×ops [FIX-4]");
+    reply_free(r);
+}
+
+/* ============================================================
+ *  §07  ZINCRBY TOCTOU 수정 검증
+ * ============================================================ */
+#define ZINCRBY_THREADS  8
+#define ZINCRBY_ITER     100
+
+static void *zincrby_worker(void *arg)
+{
+    ShmHandle *h = (ShmHandle *)arg;
+    for (int i = 0; i < ZINCRBY_ITER; i++) {
+        string_t sk={"toctou_z",8}, sd={"1",1}, sm={"counter",7};
+        string_t sc={"ZINCRBY",7};
+        string_t *args[]={&sc,&sk,&sd,&sm};
+        s_replyObject *r = cmd_dispatch(h, args, 4);
+        reply_free(r);
+    }
+    return NULL;
+}
+
+static void t07_zincrby_toctou(ShmHandle *h)
+{
+    SECT("07. ZINCRBY TOCTOU 수정 검증 [FIX-1]");
+    pthread_t tids[ZINCRBY_THREADS];
+    for (int i = 0; i < ZINCRBY_THREADS; i++)
+        pthread_create(&tids[i], NULL, zincrby_worker, h);
+    for (int i = 0; i < ZINCRBY_THREADS; i++) pthread_join(tids[i], NULL);
+
+    s_replyObject *r = run(h, "ZSCORE", "toctou_z", "counter", NULL);
+    int64_t expected = (int64_t)(ZINCRBY_THREADS * ZINCRBY_ITER);
+    int ok = (r && r->type == REPLY_STRING &&
+              llabs((int64_t)round(atof((char*)r->ptr)) - expected) == 0);
+    CHECK(ok, "ZINCRBY 동시 incr: 최종값 정확");
+    if (!ok && r && r->type == REPLY_STRING)
+        printf("  기대=%lld 실제=%s\n", (long long)expected, (char*)r->ptr);
+    reply_free(r);
+}
+
+/* ============================================================
+ *  §08  HLEN mutex 보호 검증
+ * ============================================================ */
+#define HLEN_THREADS  8
+#define HLEN_ITER     100
+
+static void *hlen_hset_worker(void *arg)
+{
+    ShmHandle *h = (ShmHandle *)arg;
+    static _Atomic int counter = 0;
+    for (int i = 0; i < HLEN_ITER; i++) {
+        int id = __atomic_fetch_add(&counter, 1, __ATOMIC_SEQ_CST);
+        char f[32], v[16];
+        snprintf(f, sizeof(f), "hlen_f_%d", id);
+        snprintf(v, sizeof(v), "v%d", id);
+        string_t sk={"hlen_key",8}, sf={f,(uint32_t)strlen(f)},sv={v,(uint32_t)strlen(v)};
+        string_t sc={"HSET",4};
+        string_t *args[]={&sc,&sk,&sf,&sv};
+        s_replyObject *r = cmd_dispatch(h, args, 4);
+        reply_free(r);
+    }
+    return NULL;
+}
+
+static void t08_hlen_mutex(ShmHandle *h)
+{
+    SECT("08. HLEN mutex 보호 검증 [FIX-4]");
+    pthread_t tids[HLEN_THREADS];
+    for (int i = 0; i < HLEN_THREADS; i++)
+        pthread_create(&tids[i], NULL, hlen_hset_worker, h);
+    for (int i = 0; i < HLEN_THREADS; i++) pthread_join(tids[i], NULL);
+
+    s_replyObject *r = run(h, "HLEN", "hlen_key", NULL);
+    int64_t expected = (int64_t)(HLEN_THREADS * HLEN_ITER);
+    CHECK(is_int(r, expected), "HLEN 동시 HSET 후 정확한 카운트");
+    reply_free(r);
+}
+
+/* ============================================================
+ *  §09  cmd_kv SET 갱신 alloc-before-free 검증
+ * ============================================================ */
+static void t09_set_update_safety(ShmHandle *h)
+{
+    SECT("09. SET 갱신: new-alloc-then-free 안전성 [FIX-1]");
+    s_replyObject *r;
+
+    /* 큰 값으로 SET 후 작은 값으로 갱신 반복 (heap 손상 없음 확인) */
+    char big[512];
+    memset(big, 'X', sizeof(big)-1); big[sizeof(big)-1]='\0';
+    r=run(h,"SET","safe_k",big,NULL); CHECK(is_ok(r),"SET 큰값→OK"); reply_free(r);
+
+    for (int i = 0; i < 50; i++) {
+        char v[16]; snprintf(v,sizeof(v),"val%d",i);
+        s_replyObject *s = run(h,"SET","safe_k",v,NULL);
+        reply_free(s);
+    }
+    r=run(h,"GET","safe_k",NULL);
+    CHECK(r&&r->type==REPLY_STRING,"SET 반복 갱신 후 GET 정상"); reply_free(r);
+
+    /* heap stats: alloc/free 균형 확인 */
+    HeapHeader *hh = core_heap_hdr(h);
+    CHECK(hh->total_free <= hh->total_alloc, "heap free ≤ alloc (누수없음)");
+}
+
+/* ============================================================
+ *  §10  멀티프로세스 stress
+ * ============================================================ */
+#define MP_PROCS  8
+#define MP_ITER   500
+
+static void mp_worker(const char *shm_name, int pid_idx)
+{
+    ShmHandle *h = shm_open_existing(shm_name);
+    if (!h) exit(1);
+    char k[32], v[32];
+    for (int i = 0; i < MP_ITER; i++) {
+        snprintf(k, sizeof(k), "mp_%d_%d", pid_idx, i);
+        snprintf(v, sizeof(v), "v%d_%d",   pid_idx, i);
+        string_t sk={k,(uint32_t)strlen(k)}, sv={v,(uint32_t)strlen(v)};
+        string_t sc={"SET",3};
+        string_t *args[]={&sc,&sk,&sv};
+        s_replyObject *r = cmd_dispatch(h, args, 3);
+        reply_free(r);
+    }
     shm_close(h);
+    exit(0);
+}
 
-    test_multiproc();
+static void t10_multiprocess(ShmHandle *h)
+{
+    SECT("10. 멀티프로세스 stress (8 proc × 500 iter)");
+    (void)h;
+    pid_t pids[MP_PROCS];
+    for (int i = 0; i < MP_PROCS; i++) {
+        pids[i] = fork();
+        if (pids[i] == 0) mp_worker(SHM_NAME, i);
+    }
+    for (int i = 0; i < MP_PROCS; i++) waitpid(pids[i], NULL, 0);
 
-    h = shm_open_existing(SHM_TEST);
-    if (h) {
-		shm_dump_stats(h);
-		shm_close(h);
+    ShmHandle *vh = shm_open_existing(SHM_NAME);
+    int ok = 1;
+    for (int i = 0; i < MP_PROCS && ok; i++) {
+        for (int j = 0; j < MP_ITER && ok; j++) {
+            char k[32]; snprintf(k, sizeof(k), "mp_%d_%d", i, j);
+            string_t sk={k,(uint32_t)strlen(k)}, sc={"GET",3};
+            string_t *a[]={&sc,&sk};
+            s_replyObject *r = cmd_dispatch(vh, a, 2);
+            if (!r || r->type != REPLY_STRING) ok = 0;
+            reply_free(r);
+        }
+    }
+    CHECK(ok, "멀티프로세스: 모든 키 정상 저장");
+    shm_close(vh);
+}
+
+/* ============================================================ §01 */
+static void t01_bset_basic(ShmHandle *h)
+{
+    SECT("01. 기본: BSET / BGET / BCARD");
+    s_replyObject *r;
+
+    r=run(h,"BSET","k","100","alice",NULL); CHECK(is_int(r,1),"BSET 신규→1"); reply_free(r);
+    r=run(h,"BGET","k","100",NULL);         CHECK(is_str(r,"alice"),"BGET 100=alice"); reply_free(r);
+    r=run(h,"BCARD","k",NULL);              CHECK(is_int(r,1),"BCARD=1"); reply_free(r);
+    r=run(h,"BGET","k","999",NULL);         CHECK(is_nil(r),"BGET 없는score→NIL"); reply_free(r);
+    r=run(h,"BGET","nokey","100",NULL);     CHECK(is_nil(r),"BGET 없는key→NIL"); reply_free(r);
+    /* 인자 부족 */
+    r=run(h,"BSET","k","100",NULL);         CHECK(is_err(r),"BSET 인자부족→ERR"); reply_free(r);
+}
+
+/* ============================================================ §02 */
+static void t02_bset_multi(ShmHandle *h)
+{
+    SECT("02. 멀티 score/value 삽입");
+    s_replyObject *r;
+
+    r=run(h,"BSET","m","10","a","20","b","30","c",NULL);
+    CHECK(is_int(r,3),"BSET 3쌍→3"); reply_free(r);
+    r=run(h,"BCARD","m",NULL); CHECK(is_int(r,3),"BCARD=3"); reply_free(r);
+    r=run(h,"BGET","m","20",NULL); CHECK(is_str(r,"b"),"BGET 20=b"); reply_free(r);
+}
+
+/* ============================================================ §03 */
+static void t03_bset_update(ShmHandle *h)
+{
+    SECT("03. 동일 score 갱신 (value 교체)");
+    s_replyObject *r;
+
+    r=run(h,"BSET","m","20","B_updated",NULL);
+    CHECK(is_int(r,0),"BSET 갱신→0"); reply_free(r);
+    r=run(h,"BGET","m","20",NULL); CHECK(is_str(r,"B_updated"),"갱신 후 BGET=B_updated"); reply_free(r);
+    r=run(h,"BCARD","m",NULL);     CHECK(is_int(r,3),"갱신 후 BCARD 변화없음=3"); reply_free(r);
+}
+
+/* ============================================================ §04 */
+static void t04_bset_rank(ShmHandle *h)
+{
+    SECT("04. BRANK");
+    s_replyObject *r;
+
+    /* m: score 10(a) 20(B_updated) 30(c) */
+    r=run(h,"BRANK","m","10",NULL); CHECK(is_int(r,0),"BRANK 10=0(최소)"); reply_free(r);
+    r=run(h,"BRANK","m","20",NULL); CHECK(is_int(r,1),"BRANK 20=1");       reply_free(r);
+    r=run(h,"BRANK","m","30",NULL); CHECK(is_int(r,2),"BRANK 30=2(최대)"); reply_free(r);
+    r=run(h,"BRANK","m","99",NULL); CHECK(is_nil(r),"BRANK 없음→NIL");    reply_free(r);
+}
+
+/* ============================================================ §05 */
+static void t05_bset_bdel(ShmHandle *h)
+{
+    SECT("05. BDEL");
+    s_replyObject *r;
+
+    run(h,"BSET","d","1","x","2","y","3","z","4","w",NULL);
+
+    r=run(h,"BDEL","d","2","3",NULL); CHECK(is_int(r,2),"BDEL 2개→2"); reply_free(r);
+    r=run(h,"BCARD","d",NULL);        CHECK(is_int(r,2),"BDEL 후 BCARD=2"); reply_free(r);
+    r=run(h,"BGET","d","2",NULL);     CHECK(is_nil(r),"BDEL 후 BGET 2→NIL"); reply_free(r);
+
+    r=run(h,"BDEL","d","99",NULL);    CHECK(is_int(r,0),"BDEL 없는score→0"); reply_free(r);
+    r=run(h,"BDEL","nokey","1",NULL); CHECK(is_int(r,0),"BDEL 없는key→0"); reply_free(r);
+}
+
+/* ============================================================ §06 */
+static void t06_bset_brange(ShmHandle *h)
+{
+    SECT("06. BRANGE (정방향 / 음수 인덱스)");
+    s_replyObject *r;
+
+    /* r_key: 10,20,30,40,50 */
+    run(h,"BSET","r","10","aa","20","bb","30","cc","40","dd","50","ee",NULL);
+
+    r=run(h,"BRANGE","r","0","4",NULL);
+    CHECK(arr_sz(r,10),"BRANGE 0 4 크기=10");
+    CHECK(arr_str(r,0,"10"),"BRANGE[0]=10"); CHECK(arr_str(r,1,"aa"),"BRANGE[1]=aa");
+    CHECK(arr_str(r,8,"50"),"BRANGE[8]=50"); CHECK(arr_str(r,9,"ee"),"BRANGE[9]=ee");
+    reply_free(r);
+
+    /* 부분 범위 */
+    r=run(h,"BRANGE","r","1","2",NULL);
+    CHECK(arr_sz(r,4),"BRANGE 1 2 크기=4");
+    CHECK(arr_str(r,0,"20"),"BRANGE 1 2 [0]=20"); reply_free(r);
+
+    /* 음수 인덱스: -1=마지막 */
+    r=run(h,"BRANGE","r","-1","-1",NULL);
+    CHECK(arr_sz(r,2),"BRANGE -1 -1 크기=2");
+    CHECK(arr_str(r,0,"50"),"BRANGE -1 [0]=50"); reply_free(r);
+
+    /* -3~-1 = idx 2,3,4 */
+    r=run(h,"BRANGE","r","-3","-1",NULL);
+    CHECK(arr_sz(r,6),"BRANGE -3 -1 크기=6");
+    CHECK(arr_str(r,0,"30"),"BRANGE -3 [0]=30"); reply_free(r);
+
+    /* 범위 초과 → 빈 배열 */
+    r=run(h,"BRANGE","r","10","20",NULL);
+    CHECK(arr_sz(r,0),"BRANGE 초과→0"); reply_free(r);
+}
+
+/* ============================================================ §07 */
+static void t07_bset_brangebyscore(ShmHandle *h)
+{
+    SECT("07. BRANGEBYSCORE [LIMIT]");
+    s_replyObject *r;
+
+    /* r_key: 10~50 */
+    r=run(h,"BRANGEBYSCORE","r","10","50",NULL);
+    CHECK(arr_sz(r,10),"BRANGEBYSCORE 10~50=10"); reply_free(r);
+
+    r=run(h,"BRANGEBYSCORE","r","20","40",NULL);
+    CHECK(arr_sz(r,6),"BRANGEBYSCORE 20~40=6");
+    CHECK(arr_str(r,0,"20"),"[0]=20"); reply_free(r);
+
+    /* LIMIT offset=1 count=2 */
+    r=run(h,"BRANGEBYSCORE","r","10","50","LIMIT","1","2",NULL);
+    CHECK(arr_sz(r,4),"BRANGEBYSCORE LIMIT 1 2 크기=4");
+    CHECK(arr_str(r,0,"20"),"LIMIT 후 [0]=20"); reply_free(r);
+
+    /* 범위 밖 */
+    r=run(h,"BRANGEBYSCORE","r","100","200",NULL);
+    CHECK(arr_sz(r,0),"BRANGEBYSCORE 범위밖=0"); reply_free(r);
+}
+
+/* ============================================================ §08 */
+static void t08_bset_bcount(ShmHandle *h)
+{
+    SECT("08. BCOUNT");
+    s_replyObject *r;
+
+    r=run(h,"BCOUNT","r","10","50",NULL); CHECK(is_int(r,5),"BCOUNT 10~50=5"); reply_free(r);
+    r=run(h,"BCOUNT","r","20","30",NULL); CHECK(is_int(r,2),"BCOUNT 20~30=2"); reply_free(r);
+    r=run(h,"BCOUNT","r","15","25",NULL); CHECK(is_int(r,1),"BCOUNT 15~25=1"); reply_free(r);
+    r=run(h,"BCOUNT","r","100","200",NULL); CHECK(is_int(r,0),"BCOUNT 범위밖=0"); reply_free(r);
+}
+
+/* ============================================================ §09 */
+static void t09_bset_pop(ShmHandle *h)
+{
+    SECT("09. BPOPMIN / BPOPMAX");
+    s_replyObject *r;
+
+    run(h,"BSET","p","1","v1","2","v2","3","v3","4","v4","5","v5",NULL);
+
+    r=run(h,"BPOPMIN","p",NULL);
+    CHECK(arr_sz(r,2),"BPOPMIN 크기=2");
+    CHECK(arr_str(r,0,"1"),"BPOPMIN score=1");
+    CHECK(arr_str(r,1,"v1"),"BPOPMIN val=v1"); reply_free(r);
+
+    r=run(h,"BCARD","p",NULL); CHECK(is_int(r,4),"BPOPMIN 후 BCARD=4"); reply_free(r);
+
+    r=run(h,"BPOPMAX","p","2",NULL);
+    CHECK(arr_sz(r,4),"BPOPMAX 2 크기=4");
+    CHECK(arr_str(r,0,"5"),"BPOPMAX[0] score=5");
+    CHECK(arr_str(r,2,"4"),"BPOPMAX[2] score=4"); reply_free(r);
+
+    r=run(h,"BCARD","p",NULL); CHECK(is_int(r,2),"BPOPMAX 후 BCARD=2"); reply_free(r);
+
+    /* 남은 것 모두 pop */
+    r=run(h,"BPOPMIN","p","10",NULL);
+    CHECK(arr_sz(r,4),"BPOPMIN 10 (남은 2개)=4"); reply_free(r);
+    r=run(h,"BCARD","p",NULL); CHECK(is_int(r,0),"전부 pop 후 BCARD=0"); reply_free(r);
+}
+
+/* ============================================================ §10 */
+static void t10_bset_drop_recreate(ShmHandle *h)
+{
+    SECT("10. BDROP 후 재생성 / 타입 충돌");
+    s_replyObject *r;
+
+    run(h,"BSET","drp","1","v",NULL);
+    r=run(h,"BDROP","drp",NULL);
+    CHECK(r&&r->type==REPLY_STATUS,"BDROP→OK"); reply_free(r);
+    r=run(h,"BCARD","drp",NULL); CHECK(is_int(r,0),"BDROP 후 BCARD=0"); reply_free(r);
+
+    r=run(h,"BDROP","nokey",NULL); CHECK(is_err(r),"BDROP 없는key→ERR"); reply_free(r);
+
+    /* 재생성 */
+    r=run(h,"BSET","drp","42","newval",NULL); CHECK(is_int(r,1),"재생성→1"); reply_free(r);
+    r=run(h,"BGET","drp","42",NULL); CHECK(is_str(r,"newval"),"재생성 BGET=newval"); reply_free(r);
+
+    /* 타입 충돌: ZADD 후 BSET */
+    run(h,"ZADD","ztype","1","m",NULL);
+    r=run(h,"BSET","ztype","1","v",NULL); CHECK(is_err(r),"BSET→ZSET key ERR"); reply_free(r);
+
+    /* 타입 충돌: BSET 후 HSET */
+    run(h,"BSET","btype","1","v",NULL);
+    r=run(h,"HSET","btype","f","v",NULL); CHECK(is_err(r),"HSET→BSET key ERR"); reply_free(r);
+}
+
+/* ============================================================ §11 */
+static void t11_bset_del_routing(ShmHandle *h)
+{
+    SECT("11. DEL 라우팅 (ENTRY_BSET → drop_bset)");
+    s_replyObject *r;
+
+    run(h,"BSET","del_b","1","v1","2","v2","3","v3",NULL);
+
+    r=run(h,"DEL","del_b",NULL);
+    CHECK(is_int(r,1),"DEL BSET→1"); reply_free(r);
+
+    r=run(h,"BCARD","del_b",NULL); CHECK(is_int(r,0),"DEL 후 BCARD=0"); reply_free(r);
+
+    /* DEL 라우팅 테이블에 BSET 포함 확인 */
+    size_t cnt=0; const DelRouteEntry *tbl=del_route_table_get(&cnt);
+    int has_bset=0;
+    for(size_t i=0;i<cnt;i++) if(tbl[i].entry_type==ENTRY_BSET) has_bset=1;
+    CHECK(has_bset,"라우팅 테이블에 ENTRY_BSET 등록됨");
+
+    /* 혼합 DEL */
+    run(h,"SET","mv","v",NULL);
+    run(h,"BSET","mb","1","v",NULL);
+    run(h,"HSET","mh","f","v",NULL);
+    r=run(h,"DEL","mv","mb","mh",NULL);
+    CHECK(is_int(r,3),"DEL KV+BSET+HASH 혼합→3"); reply_free(r);
+}
+
+/* ============================================================ §12 */
+static void t12_bset_grow(ShmHandle *h)
+{
+    SECT("12. 배열 자동 확장 (BSET_CHUNK 초과 삽입)");
+    s_replyObject *r;
+
+    /* BSET_CHUNK=1024개 초과 삽입 (1200개) */
+    const int N = 1200;
+    for(int i=0;i<N;i++){
+        char sc[16],v[16];
+        snprintf(sc,sizeof(sc),"%d",i);
+        snprintf(v, sizeof(v),"v%d",i);
+        r=run(h,"BSET","grow_k",sc,v,NULL); reply_free(r);
+    }
+    r=run(h,"BCARD","grow_k",NULL);
+    CHECK(is_int(r,N),"BSET_CHUNK 초과 후 BCARD=1200"); reply_free(r);
+
+    /* capacity 확인: BSetHeader 직접 조회 */
+    BSetHeader *bh = core_bset_get(h,"grow_k",6);
+    CHECK(bh && bh->capacity >= (uint64_t)N,
+          "capacity ≥ N (자동 확장됨)");
+    CHECK(bh && bh->capacity % BSET_CHUNK == 0,
+          "capacity는 BSET_CHUNK 배수");
+
+    /* 정렬 순서 확인 (첫 5개) */
+    r=run(h,"BRANGE","grow_k","0","4",NULL);
+    CHECK(arr_sz(r,10),"BRANGE 0 4 크기=10");
+    CHECK(arr_str(r,0,"0"),"grow 후 BRANGE[0]=score 0");
+    reply_free(r);
+
+    run(h,"BDROP","grow_k",NULL);
+}
+
+/* ============================================================ §13 */
+static void t13_bset_shrink(ShmHandle *h)
+{
+    SECT("13. 배열 자동 축소 (대량 삭제 후 shrink)");
+
+    /* 2048개 삽입 (capacity=2×BSET_CHUNK) */
+    const int N = (int)(2 * BSET_CHUNK);
+    for(int i=0;i<N;i++){
+        char sc[16],v[16];
+        snprintf(sc,sizeof(sc),"%d",i+10000); /* score 충돌 방지 */
+        snprintf(v, sizeof(v),"v%d",i);
+        s_replyObject *r=run(h,"BSET","shrk_k",sc,v,NULL); reply_free(r);
+    }
+    BSetHeader *bh = core_bset_get(h,"shrk_k",6);
+    CHECK(bh && bh->capacity >= (uint64_t)N, "삽입 후 capacity ≥ N");
+
+    /* 앞쪽 75% 삭제 → count < capacity/2 → shrink 발동 */
+    int del_cnt = (int)(N * 3 / 4);
+    for(int i=0;i<del_cnt;i++){
+        char sc[16]; snprintf(sc,sizeof(sc),"%d",i+10000);
+        s_replyObject *r=run(h,"BDEL","shrk_k",sc,NULL); reply_free(r);
+    }
+    /* shrink 확인 */
+    CHECK(bh->count == (uint64_t)(N - del_cnt), "삭제 후 count 정확");
+    CHECK(bh->capacity < (uint64_t)N, "shrink 후 capacity 감소");
+    CHECK(bh->capacity >= BSET_CHUNK,  "shrink 후 capacity ≥ BSET_CHUNK");
+
+    run(h,"BDROP","shrk_k",NULL);
+}
+
+/* ============================================================ §14 */
+#define MT_THREADS  8
+#define MT_ITER     500
+
+static void *mt_bset_worker(void *arg)
+{
+    MtArg *a = (MtArg*)arg;
+    for(int i=0;i<MT_ITER;i++){
+        /* 각 스레드는 고유 score 대역 사용 */
+        uint64_t score = (uint64_t)(a->id * MT_ITER + i);
+        char     v[32]; snprintf(v,sizeof(v),"t%d_%d",a->id,i);
+        char     sc[32]; snprintf(sc,sizeof(sc),"%llu",(unsigned long long)score);
+
+        string_t a0={"BSET",4}, a1={"mt_key",6};
+        string_t a2={sc,(uint32_t)strlen(sc)};
+        string_t a3={v, (uint32_t)strlen(v)};
+        string_t *args[]={&a0,&a1,&a2,&a3};
+        s_replyObject *r = cmd_dispatch(a->h, args, 4);
+        reply_free(r);
+    }
+    return NULL;
+}
+
+static void t14_bset_multithread(ShmHandle *h)
+{
+    SECT("14. 멀티스레드 동시 BSET (serialize 검증)");
+
+    pthread_t tids[MT_THREADS];
+    MtArg     args[MT_THREADS];
+    for(int i=0;i<MT_THREADS;i++){
+        args[i].h=h; args[i].id=i;
+        pthread_create(&tids[i],NULL,mt_bset_worker,&args[i]);
+    }
+    for(int i=0;i<MT_THREADS;i++) pthread_join(tids[i],NULL);
+
+    s_replyObject *r = run(h,"BCARD","mt_key",NULL);
+    CHECK(is_int(r,(int64_t)(MT_THREADS*MT_ITER)),
+          "멀티스레드 BSET 후 BCARD=T×ITER"); reply_free(r);
+
+    /* 정렬 순서 확인: 전체 BRANGE 0 9 */
+    r=run(h,"BRANGE","mt_key","0","9",NULL);
+    if(r&&r->type==REPLY_ARRAY&&r->elements==20){
+        uint64_t prev_sc=0; int sorted=1;
+        for(size_t i=0;i<20;i+=2){
+            uint64_t sc=(uint64_t)strtoull((char*)r->element[i]->ptr,NULL,10);
+            if(sc<prev_sc) sorted=0;
+            prev_sc=sc;
+        }
+        CHECK(sorted,"BRANGE 결과 오름차순 정렬");
+    } else {
+        CHECK(0,"BRANGE 0 9 응답 이상");
+    }
+    reply_free(r);
+
+    run(h,"BDROP","mt_key",NULL);
+}
+
+/* ============================================================ §15 */
+static void mp_bset_proc(const char *shm_name, int id)
+{
+    ShmHandle *h=shm_open_existing(shm_name);
+    if(!h) exit(1);
+    for(int i=0;i<MP_ITER;i++){
+        uint64_t score=(uint64_t)(id*MP_ITER+i);
+        char v[32],sc[32];
+        snprintf(v,sizeof(v),"p%d_%d",id,i);
+        snprintf(sc,sizeof(sc),"%llu",(unsigned long long)score);
+        string_t a0={"BSET",4},a1={"mp_key",6};
+        string_t a2={sc,(uint32_t)strlen(sc)};
+        string_t a3={v,(uint32_t)strlen(v)};
+        string_t *args[]={&a0,&a1,&a2,&a3};
+        s_replyObject *r=cmd_dispatch(h,args,4); reply_free(r);
+    }
+    shm_close(h);
+    exit(0);
+}
+
+static void t15_bset_multiprocess(ShmHandle *h)
+{
+    SECT("15. 멀티프로세스 동시 BSET (8 proc × 200 iter)");
+    (void)h;
+
+    pid_t pids[MP_PROCS];
+    for(int i=0;i<MP_PROCS;i++){
+        pids[i]=fork();
+        if(pids[i]==0) mp_bset_proc(SHM_NAME,i);
+    }
+    for(int i=0;i<MP_PROCS;i++) waitpid(pids[i],NULL,0);
+
+    ShmHandle *vh=shm_open_existing(SHM_NAME);
+    s_replyObject *r=run(vh,"BCARD","mp_key",NULL);
+    CHECK(is_int(r,(int64_t)(MP_PROCS*MP_ITER)),
+          "멀티프로세스 BSET 후 BCARD=P×ITER"); reply_free(r);
+
+    /* 임의 score 존재 확인 */
+    char sc[32]; snprintf(sc,sizeof(sc),"%d", (MP_PROCS/2)*MP_ITER + MP_ITER/2);
+    r=run(vh,"BGET","mp_key",sc,NULL);
+    CHECK(r&&r->type==REPLY_STRING,"멀티프로세스: 임의 score BGET 성공"); reply_free(r);
+
+    run(vh,"BDROP","mp_key",NULL);
+    shm_close(vh);
+}
+/* ============================================================
+ *  main
+ * ============================================================ */
+int main(void)
+{
+    printf("╔══════════════════════════════════════════════╗\n");
+    printf("║       mredis 전체 통합 테스트                ║\n");
+    printf("╚══════════════════════════════════════════════╝\n");
+
+    shm_destroy(SHM_NAME);
+    ShmHandle *h = shm_create(SHM_NAME, 256ULL * 1024 * 1024);
+    if (!h) { fprintf(stderr, "SHM 생성 실패\n"); return 1; }
+    shm_set_debug_level(DBG_ERROR);
+
+    t01_kv(h);
+    t02_keys(h);
+    t03_del(h);
+    t04_zset(h);
+    t05_hash(h);
+    t06_serialize(h);
+    t07_zincrby_toctou(h);
+    t08_hlen_mutex(h);
+    t09_set_update_safety(h);
+    t10_multiprocess(h);
+
+   t01_bset_basic(h);     t02_bset_multi(h);    t03_bset_update(h);
+   t04_bset_rank(h);      t05_bset_bdel(h);     t06_bset_brange(h);
+   t07_bset_brangebyscore(h);t08_bset_bcount(h);t09_bset_pop(h);
+   t10_bset_drop_recreate(h);t11_bset_del_routing(h);
+   t12_bset_grow(h);      t13_bset_shrink(h);
+   t14_bset_multithread(h);t15_bset_multiprocess(h);
+
+
+	s_replyObject *r = run(h,"KEYS","*",NULL);
+	for (size_t i=0;i<r->elements;i++)	{
+		char	tmpstr[1024];
+		sprintf (tmpstr, "%.*s", (int)r->element[i]->len, (char*)r->element[i]->ptr);
+		reply_free (run(h,"DEL", tmpstr, NULL));
 	}
-//    shm_destroy(SHM_TEST);
+	reply_free(r);
+	r = run(h,"KEYS","*",NULL);
+	reply_print(r, 0);
+	shm_dump_stats(h);
+    shm_close(h);
+    shm_destroy(SHM_NAME);
 
-    printf("\n==========================================\n");
-    printf("  최종: PASS=\033[32m%d\033[0m  FAIL=\033[31m%d\033[0m\n",
-           g_pass, g_fail);
-    printf("==========================================\n");
-    return (g_fail == 0) ? 0 : 1;
+    printf("\n══════════════════════════════════════════════\n");
+    printf("결과: \033[32mPASS %d\033[0m / \033[31mFAIL %d\033[0m / 합계 %d\n",
+           g_pass, g_fail, g_pass + g_fail);
+    printf("══════════════════════════════════════════════\n");
+    return g_fail > 0 ? 1 : 0;
 }
