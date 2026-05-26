@@ -3,7 +3,8 @@
 # ═══════════════════════════════════════════════════════
 
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE -D_REENTRANT
+#CFLAGS  = -Wall -Wextra -fPIC -O2 -g -std=c11 -D_GNU_SOURCE -D_REENTRANT
+CFLAGS  = -Wall -fPIC -O2 -g -std=c11 -D_GNU_SOURCE -D_REENTRANT
 LDFLAGS = -lrt -lpthread -lm
 
 # ── 컴파일 파라미터 ──────────────────────────────────────
@@ -29,6 +30,7 @@ CMD_SRCS  = cmd_kv.c cmd_zset.c cmd_hash.c cmd_keys.c \
             cmd_del.c cmd_dispatch.c cmd_pubsub.c cmd_bset.c
 
 ALL_SRCS  = $(CORE_SRCS) $(CMD_SRCS)
+ALL_OBJS  = $(ALL_SRCS:.c=.o)
 
 # ── 헤더 (변경 시 전체 재빌드) ───────────────────────────
 HDRS = shm_types.h shm_core.h \
@@ -38,7 +40,11 @@ HDRS = shm_types.h shm_core.h \
 .PHONY: all ci prod test clean
 
 # 기본 타겟: CI 빌드로 테스트
-all: ci
+all: ci lib
+
+lib: $(ALL_OBJS)
+	ar -ruv libmredis.a $(ALL_OBJS)
+	$(CC) -shared -o libmredis.so $(ALL_OBJS) $(LDFLAGS) -rdynamic
 
 # ── CI: 테스트 빌드 + 실행 ──────────────────────────────
 ci: test_all_ci

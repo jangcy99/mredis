@@ -118,7 +118,7 @@ static void t01_kv(ShmHandle *h)
     r=run(h,"SET","","v",NULL); CHECK(is_err(r),"SET 빈key→ERR"); reply_free(r);
 
     /* 타입 충돌: ZADD 후 SET */
-    run(h,"ZADD","ztype","1","m",NULL);
+    r=run(h,"ZADD","ztype","1","m",NULL); reply_free(r);
     r=run(h,"SET","ztype","v",NULL); CHECK(is_err(r),"SET→ZSET key ERR"); reply_free(r);
 
     /* 인자 부족 */
@@ -133,9 +133,9 @@ static void t02_keys(ShmHandle *h)
     SECT("02. KEYS – 패턴 매칭 [FIX: 버킷 mutex 보호]");
     s_replyObject *r;
 
-    run(h,"SET","key:a","1",NULL);
-    run(h,"SET","key:b","2",NULL);
-    run(h,"SET","other","3",NULL);
+    r=run(h,"SET","key:a","1",NULL); reply_free(r);
+    r=run(h,"SET","key:b","2",NULL); reply_free(r);
+    r=run(h,"SET","other","3",NULL); reply_free(r);
 
     r=run(h,"KEYS","key:*",NULL);
     CHECK(r&&r->type==REPLY_ARRAY, "KEYS key:* → ARRAY");
@@ -162,9 +162,9 @@ static void t03_del(ShmHandle *h)
     SECT("03. DEL – 타입별 라우팅 / 혼합 / 없는키 / 중복");
     s_replyObject *r;
 
-    run(h,"SET",  "dkv","v",          NULL);
-    run(h,"ZADD", "dzs","1","m",       NULL);
-    run(h,"HSET", "dhs","f","v",       NULL);
+    r=run(h,"SET",  "dkv","v",          NULL); reply_free(r);
+    r=run(h,"ZADD", "dzs","1","m",       NULL); reply_free(r);
+    r=run(h,"HSET", "dhs","f","v",       NULL); reply_free(r);
 
     /* DEL KV */
     r=run(h,"DEL","dkv",NULL);
@@ -182,7 +182,9 @@ static void t03_del(ShmHandle *h)
     r=run(h,"HLEN","dhs",NULL); CHECK(is_int(r,0),"DEL 후 HLEN=0"); reply_free(r);
 
     /* 혼합 */
-    run(h,"SET","mk","v",NULL); run(h,"ZADD","mz","1","a",NULL); run(h,"HSET","mh","f","v",NULL);
+    r=run(h,"SET","mk","v",NULL); reply_free(r);
+	r=run(h,"ZADD","mz","1","a",NULL); reply_free(r);
+	r=run(h,"HSET","mh","f","v",NULL);reply_free(r);
     r=run(h,"DEL","mk","mz","mh",NULL);
     CHECK(is_int(r,3),"DEL 혼합 3→3"); reply_free(r);
 
@@ -190,7 +192,7 @@ static void t03_del(ShmHandle *h)
     r=run(h,"DEL","nokey",NULL); CHECK(is_int(r,0),"DEL 없는키→0"); reply_free(r);
 
     /* 중복 키 */
-    run(h,"SET","dup","v",NULL);
+    r=run(h,"SET","dup","v",NULL); reply_free(r);
     r=run(h,"DEL","dup","dup",NULL);
     CHECK(is_int(r,1),"DEL 중복→1(두번째없음)"); reply_free(r);
 
@@ -199,12 +201,12 @@ static void t03_del(ShmHandle *h)
     CHECK(cnt>=3,"라우팅 테이블 ≥ 3항목");
 
     /* DEL 후 재생성 (KV→ZSET→HASH 순환) */
-    run(h,"SET","reuse","kv",NULL);
-    run(h,"DEL","reuse",NULL);
+    r=run(h,"SET","reuse","kv",NULL); reply_free(r);
+    r=run(h,"DEL","reuse",NULL); reply_free(r);
     r=run(h,"ZADD","reuse","10","m",NULL); CHECK(r&&r->type==REPLY_INTEGER,"재생성 ZADD"); reply_free(r);
-    run(h,"DEL","reuse",NULL);
+    reply_free(run(h,"DEL","reuse",NULL));
     r=run(h,"HSET","reuse","f","v",NULL);  CHECK(r&&r->type==REPLY_INTEGER,"재생성 HSET"); reply_free(r);
-    run(h,"DEL","reuse",NULL);
+    reply_free(run(h,"DEL","reuse",NULL));
 }
 
 /* ============================================================
@@ -298,7 +300,7 @@ static void t04_zset(ShmHandle *h)
     r=run(h,"ZCARD","zs",NULL);        CHECK(is_int(r,2),"ZREM 후 ZCARD=2"); reply_free(r);
 
     /* ZPOPMIN / ZPOPMAX */
-    run(h,"ZADD","zpk","1","a","2","b","3","c",NULL);
+    reply_free(run(h,"ZADD","zpk","1","a","2","b","3","c",NULL));
     r=run(h,"ZPOPMIN","zpk",NULL);
     CHECK(arr_sz(r,2)&&r->element[0]&&strcmp((char*)r->element[0]->ptr,"a")==0,"ZPOPMIN=a"); reply_free(r);
     r=run(h,"ZPOPMAX","zpk","2",NULL);
@@ -345,18 +347,18 @@ static void t05_hash(ShmHandle *h)
     r=run(h,"HLEN","user",NULL);              CHECK(is_int(r,1),"HDEL 후 HLEN=1"); reply_free(r);
 
     /* HGETALL / HKEYS / HVALS [FIX-5: cap 조정] */
-    run(h,"HSET","hh","f1","v1","f2","v2","f3","v3",NULL);
+    reply_free(run(h,"HSET","hh","f1","v1","f2","v2","f3","v3",NULL));
     r=run(h,"HGETALL","hh",NULL); CHECK(arr_sz(r,6),"HGETALL=6"); reply_free(r);
     r=run(h,"HKEYS",  "hh",NULL); CHECK(arr_sz(r,3),"HKEYS=3");   reply_free(r);
     r=run(h,"HVALS",  "hh",NULL); CHECK(arr_sz(r,3),"HVALS=3");   reply_free(r);
 
     /* HINCRBY */
-    run(h,"HSET","cnt","n","10",NULL);
+    reply_free(run(h,"HSET","cnt","n","10",NULL));
     r=run(h,"HINCRBY","cnt","n","5",NULL); CHECK(is_int(r,15),"HINCRBY 10+5=15"); reply_free(r);
     r=run(h,"HINCRBY","cnt","n","-3",NULL); CHECK(is_int(r,12),"HINCRBY 15-3=12"); reply_free(r);
 
     /* HINCRBYFLOAT */
-    run(h,"HSET","flt","x","1.5",NULL);
+    reply_free(run(h,"HSET","flt","x","1.5",NULL));
     r=run(h,"HINCRBYFLOAT","flt","x","0.5",NULL);
     CHECK(r&&r->type==REPLY_STRING&&fabs(atof((char*)r->ptr)-2.0)<1e-9,"HINCRBYFLOAT=2.0"); reply_free(r);
 
@@ -600,11 +602,13 @@ static void mp_worker(const char *shm_name, int pid_idx)
 static void t10_multiprocess(ShmHandle *h)
 {
     SECT("10. 멀티프로세스 stress (8 proc × 500 iter)");
-    (void)h;
     pid_t pids[MP_PROCS];
     for (int i = 0; i < MP_PROCS; i++) {
         pids[i] = fork();
-        if (pids[i] == 0) mp_worker(SHM_NAME, i);
+        if (pids[i] == 0)	{
+			shm_close(h);
+			mp_worker(SHM_NAME, i);
+		}
     }
     for (int i = 0; i < MP_PROCS; i++) waitpid(pids[i], NULL, 0);
 
@@ -682,7 +686,7 @@ static void t05_bset_bdel(ShmHandle *h)
     SECT("05. BDEL");
     s_replyObject *r;
 
-    run(h,"BSET","d","1","x","2","y","3","z","4","w",NULL);
+    reply_free(run(h,"BSET","d","1","x","2","y","3","z","4","w",NULL));
 
     r=run(h,"BDEL","d","2","3",NULL); CHECK(is_int(r,2),"BDEL 2개→2"); reply_free(r);
     r=run(h,"BCARD","d",NULL);        CHECK(is_int(r,2),"BDEL 후 BCARD=2"); reply_free(r);
@@ -699,7 +703,7 @@ static void t06_bset_brange(ShmHandle *h)
     s_replyObject *r;
 
     /* r_key: 10,20,30,40,50 */
-    run(h,"BSET","r","10","aa","20","bb","30","cc","40","dd","50","ee",NULL);
+    reply_free(run(h,"BSET","r","10","aa","20","bb","30","cc","40","dd","50","ee",NULL));
 
     r=run(h,"BRANGE","r","0","4",NULL);
     CHECK(arr_sz(r,10),"BRANGE 0 4 크기=10");
@@ -769,7 +773,7 @@ static void t09_bset_pop(ShmHandle *h)
     SECT("09. BPOPMIN / BPOPMAX");
     s_replyObject *r;
 
-    run(h,"BSET","p","1","v1","2","v2","3","v3","4","v4","5","v5",NULL);
+    reply_free(run(h,"BSET","p","1","v1","2","v2","3","v3","4","v4","5","v5",NULL));
 
     r=run(h,"BPOPMIN","p",NULL);
     CHECK(arr_sz(r,2),"BPOPMIN 크기=2");
@@ -797,7 +801,7 @@ static void t10_bset_drop_recreate(ShmHandle *h)
     SECT("10. BDROP 후 재생성 / 타입 충돌");
     s_replyObject *r;
 
-    run(h,"BSET","drp","1","v",NULL);
+    r=run(h,"BSET","drp","1","v",NULL); reply_free(r);
     r=run(h,"BDROP","drp",NULL);
     CHECK(r&&r->type==REPLY_STATUS,"BDROP→OK"); reply_free(r);
     r=run(h,"BCARD","drp",NULL); CHECK(is_int(r,0),"BDROP 후 BCARD=0"); reply_free(r);
@@ -809,11 +813,11 @@ static void t10_bset_drop_recreate(ShmHandle *h)
     r=run(h,"BGET","drp","42",NULL); CHECK(is_str(r,"newval"),"재생성 BGET=newval"); reply_free(r);
 
     /* 타입 충돌: ZADD 후 BSET */
-    run(h,"ZADD","ztype","1","m",NULL);
+    r=run(h,"ZADD","ztype","1","m",NULL); reply_free(r);
     r=run(h,"BSET","ztype","1","v",NULL); CHECK(is_err(r),"BSET→ZSET key ERR"); reply_free(r);
 
     /* 타입 충돌: BSET 후 HSET */
-    run(h,"BSET","btype","1","v",NULL);
+    r=run(h,"BSET","btype","1","v",NULL); reply_free(r);
     r=run(h,"HSET","btype","f","v",NULL); CHECK(is_err(r),"HSET→BSET key ERR"); reply_free(r);
 }
 
@@ -823,7 +827,7 @@ static void t11_bset_del_routing(ShmHandle *h)
     SECT("11. DEL 라우팅 (ENTRY_BSET → drop_bset)");
     s_replyObject *r;
 
-    run(h,"BSET","del_b","1","v1","2","v2","3","v3",NULL);
+    reply_free(run(h,"BSET","del_b","1","v1","2","v2","3","v3",NULL));
 
     r=run(h,"DEL","del_b",NULL);
     CHECK(is_int(r,1),"DEL BSET→1"); reply_free(r);
@@ -837,9 +841,9 @@ static void t11_bset_del_routing(ShmHandle *h)
     CHECK(has_bset,"라우팅 테이블에 ENTRY_BSET 등록됨");
 
     /* 혼합 DEL */
-    run(h,"SET","mv","v",NULL);
-    run(h,"BSET","mb","1","v",NULL);
-    run(h,"HSET","mh","f","v",NULL);
+    r=run(h,"SET","mv","v",NULL); reply_free(r);
+    r=run(h,"BSET","mb","1","v",NULL); reply_free(r);
+    r=run(h,"HSET","mh","f","v",NULL); reply_free(r);
     r=run(h,"DEL","mv","mb","mh",NULL);
     CHECK(is_int(r,3),"DEL KV+BSET+HASH 혼합→3"); reply_free(r);
 }
@@ -874,7 +878,8 @@ static void t12_bset_grow(ShmHandle *h)
     CHECK(arr_str(r,0,"0"),"grow 후 BRANGE[0]=score 0");
     reply_free(r);
 
-    run(h,"BDROP","grow_k",NULL);
+    r=run(h,"BDROP","grow_k",NULL);
+    reply_free(r);
 }
 
 /* ============================================================ §13 */
@@ -904,7 +909,8 @@ static void t13_bset_shrink(ShmHandle *h)
     CHECK(bh->capacity < (uint64_t)N, "shrink 후 capacity 감소");
     CHECK(bh->capacity >= BSET_CHUNK,  "shrink 후 capacity ≥ BSET_CHUNK");
 
-    run(h,"BDROP","shrk_k",NULL);
+    s_replyObject *r=run(h,"BDROP","shrk_k",NULL);
+	reply_free(r);
 }
 
 /* ============================================================ §14 */
@@ -961,7 +967,8 @@ static void t14_bset_multithread(ShmHandle *h)
     }
     reply_free(r);
 
-    run(h,"BDROP","mt_key",NULL);
+    r=run(h,"BDROP","mt_key",NULL);
+	reply_free(r);
 }
 
 /* ============================================================ §15 */
@@ -992,7 +999,10 @@ static void t15_bset_multiprocess(ShmHandle *h)
     pid_t pids[MP_PROCS];
     for(int i=0;i<MP_PROCS;i++){
         pids[i]=fork();
-        if(pids[i]==0) mp_bset_proc(SHM_NAME,i);
+        if(pids[i]==0) {
+			shm_close(h);
+			mp_bset_proc(SHM_NAME,i);
+		}
     }
     for(int i=0;i<MP_PROCS;i++) waitpid(pids[i],NULL,0);
 
@@ -1006,9 +1016,101 @@ static void t15_bset_multiprocess(ShmHandle *h)
     r=run(vh,"BGET","mp_key",sc,NULL);
     CHECK(r&&r->type==REPLY_STRING,"멀티프로세스: 임의 score BGET 성공"); reply_free(r);
 
-    run(vh,"BDROP","mp_key",NULL);
+    r=run(vh,"BDROP","mp_key",NULL);
+	reply_free(r);
     shm_close(vh);
 }
+
+#if 0
+/* ============================================================
+ *  §16  CSET (Chunk-based Sorted Set)
+ * ============================================================ */
+static void t16_cset_basic(ShmHandle *h)
+{
+    SECT("16. CSET 기본: CSET / CGET / CCARD");
+    s_replyObject *r;
+
+    r=run(h,"CSET","c1","100","alice",NULL); 
+    CHECK(is_int(r,1),"CSET 신규→1"); reply_free(r);
+
+    r=run(h,"CGET","c1","100",NULL); 
+    CHECK(arr_sz(r,2) && arr_str(r,1,"alice"),"CGET [score,value]"); reply_free(r);
+
+    r=run(h,"CCARD","c1",NULL); 
+    CHECK(is_int(r,1),"CCARD=1"); reply_free(r);
+}
+
+static void t17_cset_multi(ShmHandle *h)
+{
+    SECT("17. CSET 멀티 삽입 + 동일 score 갱신");
+    s_replyObject *r;
+
+    r=run(h,"CSET","c2","10","a","20","b","30","c",NULL);
+    CHECK(is_int(r,3),"CSET 3쌍→3"); reply_free(r);
+
+    /* 동일 score value 갱신 */
+    r=run(h,"CSET","c2","20","b_updated",NULL);
+    CHECK(is_int(r,0),"동일 score 갱신→0"); reply_free(r);
+
+    r=run(h,"CGET","c2","20",NULL);
+    CHECK(arr_str(r,1,"b_updated"),"value 갱신 확인"); reply_free(r);
+}
+
+static void t18_cset_rank_range(ShmHandle *h)
+{
+    SECT("18. CRANK / CRANGE / CRANGEBYSCORE");
+    s_replyObject *r;
+
+    /* c3: 10(a), 20(b), 30(c) */
+    run(h,"CSET","c3","10","a","20","b","30","c",NULL);
+
+    r=run(h,"CRANK","c3","20",NULL); CHECK(is_int(r,1),"CRANK b=1"); reply_free(r);
+    r=run(h,"CRANK","c3","99",NULL); CHECK(is_nil(r),"CRANK 없음→NIL"); reply_free(r);
+
+    r=run(h,"CRANGE","c3","0","2",NULL);
+    CHECK(arr_sz(r,9),"CRANGE 0 2 = 3*3"); reply_free(r);
+
+    r=run(h,"CRANGEBYSCORE","c3","15","25",NULL);
+    CHECK(arr_sz(r,3),"CRANGEBYSCORE 15~25=1"); reply_free(r);
+}
+
+static void t19_cset_pop_del(ShmHandle *h)
+{
+    SECT("19. CPOPMIN / CDEL / CDROP");
+    s_replyObject *r;
+
+    run(h,"CSET","cp","5","x","10","y","15","z",NULL);
+
+    r=run(h,"CPOPMIN","cp",NULL);
+    CHECK(arr_sz(r,2) && arr_str(r,0,"5"),"CPOPMIN x"); reply_free(r);
+
+    r=run(h,"CDEL","cp","15",NULL);
+    CHECK(is_int(r,1),"CDEL 1"); reply_free(r);
+
+    r=run(h,"CCARD","cp",NULL); CHECK(is_int(r,1),"CCARD=1"); reply_free(r);
+
+    r=run(h,"CDROP","cp",NULL); CHECK(is_ok(r),"CDROP→OK"); reply_free(r);
+}
+
+static void t20_cset_multithread(ShmHandle *h)
+{
+    SECT("20. CSET 멀티스레드 (serialize 검증)");
+    pthread_t tids[MT_THREADS];
+    MtArg args[MT_THREADS];
+
+    for(int i=0; i<MT_THREADS; i++){
+        args[i].h = h; args[i].id = i;
+        pthread_create(&tids[i], NULL, mt_bset_worker, &args[i]);  /* BSET worker 재사용 가능 */
+    }
+    for(int i=0; i<MT_THREADS; i++) pthread_join(tids[i], NULL);
+
+    s_replyObject *r = run(h,"CCARD","mt_key",NULL);
+    CHECK(is_int(r, (int64_t)(MT_THREADS*MT_ITER)), "CSET 멀티스레드 카운트 정확");
+    reply_free(r);
+}
+#endif
+
+
 /* ============================================================
  *  main
  * ============================================================ */
@@ -1022,6 +1124,12 @@ int main(void)
     ShmHandle *h = shm_create(SHM_NAME, 256ULL * 1024 * 1024);
     if (!h) { fprintf(stderr, "SHM 생성 실패\n"); return 1; }
     shm_set_debug_level(DBG_ERROR);
+
+#if 0
+    t01_bset_basic(h);
+	shm_close(h);
+	return 0;
+#endif
 
     t01_kv(h);
     t02_keys(h);
@@ -1041,6 +1149,13 @@ int main(void)
    t12_bset_grow(h);      t13_bset_shrink(h);
    t14_bset_multithread(h);t15_bset_multiprocess(h);
 
+#if 0
+    t16_cset_basic(h);
+    t17_cset_multi(h);
+    t18_cset_rank_range(h);
+    t19_cset_pop_del(h);
+    t20_cset_multithread(h);
+#endif
 
 	s_replyObject *r = run(h,"KEYS","*",NULL);
 	for (size_t i=0;i<r->elements;i++)	{
@@ -1051,6 +1166,7 @@ int main(void)
 	reply_free(r);
 	r = run(h,"KEYS","*",NULL);
 	reply_print(r, 0);
+	reply_free(r);
 	shm_dump_stats(h);
     shm_close(h);
     shm_destroy(SHM_NAME);

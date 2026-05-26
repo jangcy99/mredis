@@ -36,8 +36,8 @@
 #include "shm_core.h"
 #include "cmd_zset.h"
 #include "cmd_hash.h"
-#include "cmd_bset.h"
 #include "cmd_del.h"
+#include "cmd_bset.h"
 
 /* ============================================================
  *  §1  타입별 drop 래퍼
@@ -190,6 +190,12 @@ static int drop_hash(ShmHandle *h, const void *key, uint32_t klen)
     return SHM_OK;
 }
 
+
+/* ── ENTRY_BSET drop ────────────────────────────────────────
+ *  ① bucket lock → NameEntry 제거 → bucket unlock
+ *  ② BSetHeader.mutex lock → 모든 BSetEntry value 해제 → unlock
+ *  ③ BSetHeader + 배열 힙 해제
+ * ─────────────────────────────────────────────────────────── */
 static int drop_bset(ShmHandle *h, const void *key, uint32_t klen)
 {
     uint32_t     idx = shm_hash(key, klen);
@@ -211,16 +217,13 @@ static int drop_bset(ShmHandle *h, const void *key, uint32_t klen)
     nameentry_free(h, ne_off);
     pthread_mutex_unlock(&bk->mutex);
 
-    int rc = pthread_mutex_lock(&bh->mutex);
-    if (rc == EOWNERDEAD) pthread_mutex_consistent(&bh->mutex);
-
+    pthread_rwlock_wrlock(&bh->rwlock);
     BSetEntry *arr = (BSetEntry *)OFF2PTR(h, bh->array_offset);
     for (uint64_t i = 0; i < bh->count; i++)
         heap_free(h, arr[i].offset);
     heap_free(h, bh->array_offset);
-
-    pthread_mutex_unlock(&bh->mutex);
-    pthread_mutex_destroy(&bh->mutex);
+    pthread_rwlock_unlock(&bh->rwlock);
+    pthread_rwlock_destroy(&bh->rwlock);
     heap_free(h, bh_off);
 
     LOG_TRACE("DEL(BSET): '%.*s'", klen, (const char *)key);

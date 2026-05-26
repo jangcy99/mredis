@@ -5,6 +5,8 @@
 #include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <libgen.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -211,6 +213,15 @@ typedef struct	{
 
 channel_info_t	*chnnl;
 
+void *subscribe_cleaner (void *args __attribute__((unused)))	{
+	while (running)	{
+		sleep (3);	// 그냥 3초마다 돌면서 pidcnt가 0인 넘을 찾아서 지우자
+		pubsub_cleanup(g_shm);
+	}
+	printf ("%s Terminated", __func__);
+	return NULL;
+}
+
 void *subscribe_manager (void *args __attribute__((unused)))	{
 	while (running)	{
 		fd_set	fdset;
@@ -244,6 +255,7 @@ void *subscribe_manager (void *args __attribute__((unused)))	{
 		reply_free(r);
 	}
 	close (sigfd);
+	printf ("%s Terminated", __func__);
 	return NULL;
 }
 int register_subscribe (int fd, pthread_mutex_t *mutex, const void *ptr, int len)	{
@@ -342,6 +354,7 @@ void fd_clear_subscribe (int sockfd)	{
 					if (c == chnnl)	{
 						prev = NULL;
 						chnnl = c->next;
+						if (chnnl == NULL)	break;
 					}
 					else if (prev)	prev->next = c->next;
 					void *next = c->next;
@@ -357,6 +370,7 @@ void fd_clear_subscribe (int sockfd)	{
 				break;
 			}
 		}
+		if (chnnl == NULL)	break;
 		prev = c;
 		c = c->next;
 	}
@@ -459,18 +473,58 @@ static void *client_handler(void *arg)
     return NULL;
 }
 
+int	verbose = DBG_INFO;
+int	port = DEFAULT_PORT;
+int daemonflag;
+
+int	getoption (int argc, char *argv[])	{
+	int	n = 1;
+	while (n < argc)	{
+		if (strcasecmp (argv[n], "--verbose") == 0)	{
+			n ++; if (n >= argc)	return -1;
+			if (isdigit(argv[n][0]))	{
+				verbose = atoi(argv[n]);
+			}
+			else	{
+				if (strcasecmp (argv[n], "DBG_NONE") == 0)	verbose = DBG_NONE;
+				else if (strcasecmp (argv[n], "DBG_ERROR") == 0)	verbose = DBG_ERROR;
+				else if (strcasecmp (argv[n], "DBG_WARN") == 0)		verbose = DBG_WARN;
+				else if (strcasecmp (argv[n], "DBG_INFO") == 0)		verbose = DBG_INFO;
+				else if (strcasecmp (argv[n], "DBG_TRACE") == 0)	verbose = DBG_TRACE;
+			}
+		}
+		else if (strcasecmp (argv[n], "--port") == 0)	{
+			n ++; if (n >= argc)	return -1;
+			port = atoi (argv[n]);
+		}
+		else if (strcasecmp (argv[n], "--daemon") == 0)	{
+			daemonflag = 1;
+		}
+		n ++;
+	}
+	return 0;
+}
+
+void	usage(char *pname)	{
+	printf ("%s --port [portno] --verbose --daemon\n", basename (pname));
+	printf ("\tverbose [DBG_NONE|DBG_ERROR|DBG_WARN|DBG_INFO|DBG_TRACE]\n");
+	return;
+}
 /* ============================================================
  *  MAIN
  * ============================================================ */
 int main(int argc, char *argv[])
 {
-    int port = DEFAULT_PORT;
-    if (argc > 1) port = atoi(argv[1]);
+	int rc = getoption (argc, argv);
+	if (rc < 0)	{
+		usage(argv[0]);
+		return 0;
+	}
 
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-	shm_set_debug_level(4);
+	shm_set_debug_level(verbose);
     printf("==================================================================\n");
     printf("     MREDIS RESP Server (Redis Compatible) pid:%d\n", getpid());
     printf("==================================================================\n");
@@ -521,6 +575,8 @@ int main(int argc, char *argv[])
     printf("   redis-cli -p %d 로 접속해보세요.\n\n", port);
 	pthread_t stid;
 	pthread_create (&stid, NULL, subscribe_manager, NULL);
+	pthread_t ctid;
+	pthread_create (&ctid, NULL, subscribe_cleaner, NULL);
 
 	struct timeval	tv;
 

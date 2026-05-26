@@ -468,7 +468,7 @@ s_replyObject *pubsub_handle_event(ShmHandle *h, int signalfd_fd)
 void pubsub_cleanup(ShmHandle *h)
 {
     if (!h) return;
-    LOG_INFO("[PubSub] cleanup 시작");
+    LOG_TRACE("[PubSub] cleanup 시작");
 
     ShmHeader *shdr = core_shm_hdr(h);
     uint32_t cleaned = 0;
@@ -515,7 +515,7 @@ void pubsub_cleanup(ShmHandle *h)
         }
         pthread_mutex_unlock(&bk->mutex);
     }
-    LOG_INFO("[PubSub] cleanup 완료: %u 채널 삭제", cleaned);
+    LOG_TRACE("[PubSub] cleanup 완료: %u 채널 삭제", cleaned);
 }
 
 /* ============================================================
