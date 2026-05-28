@@ -439,11 +439,13 @@ int main(void) {
     t01_kv(h); t02_keys(h); t03_del(h); t04_zset(h); t05_hash(h);
     t06_bset(h); t07_cset(h); t08_serialize(h); t09_zincrby(h); t10_mp(h);
 
+#if 1
 	s_replyObject *r = run(h, "KEYS", "*", NULL);
 	for (size_t i=0;i<r->elements;i++)	{
 		reply_free(run(h, "DEL", r->element[i]->ptr, NULL));
 	}
 	reply_free(r);
+#endif
 
 	shm_dump_stats(h);
     shm_close(h); shm_destroy(SHM_NAME);

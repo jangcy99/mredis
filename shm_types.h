@@ -344,14 +344,21 @@ typedef struct {
     /* 뒤이어 uint64_t field_buckets[n_buckets] */
 } HashHeader;
 
-#define BIN_COUNT          26
+#define BIN_COUNT          32
 
 typedef struct BlockHeader {
     uint64_t size;       /* 반드시 유지되는 데이터 크기 */
+    uint64_t prev;       /* free list only */
     uint64_t next;       /* free list only */
     uint32_t magic;
     uint32_t flags;
 } BlockHeader;
+
+typedef struct BlockFooter {
+    uint64_t size;       /* 반드시 유지되는 데이터 크기 */
+    uint32_t magic;
+    uint32_t _pad;
+} BlockFooter;
 
 
 typedef struct {

@@ -99,66 +99,203 @@ uint32_t shm_field_hash(const void *f, uint32_t flen, uint32_t nb)
 
 #define ALIGN_SIZE         8
 #define MIN_BLOCK_SIZE     64
-#define BIN_COUNT          26
-
-static const uint64_t size_class_limits[BIN_COUNT] = {
-    64, 128, 256, 512, 1024, 2048, 4096, 8192,
-    16384, 32768, 65536, 131072, 262144, 524288,
-    1048576, 2097152, 4194304, 8388608, 16777216,
-    33554432, 67108864, 134217728, 268435456, 536870912,
-    1073741824, UINT64_MAX
-};
 
 #define GET_IS_FREE(f)     ((f) & 1u)
 #define SET_IS_FREE(f, v)  do { (f) = ((f) & ~1u) | ((v) ? 1u : 0u); } while(0)
-#define GET_BIN_IDX(f)     (((f) >> 8) & 0x1Fu)
 #define SET_BIN_IDX(f, b)  do { (f) = ((f) & 0xFFu) | (((uint32_t)(b) & 0x1F) << 8); } while(0)
+#define GET_BIN_IDX(f)     (((f) >> 8) & 0x1Fu)
 
 static uint32_t get_bin_index(uint64_t size)
 {
-    for (uint32_t i = 0; i < BIN_COUNT - 1; i++) {
-        if (size <= size_class_limits[i])
-            return i;
-    }
-    return BIN_COUNT - 1;
+	if (size <= 64) return 0;
+
+    // 64 초과인 경우 비트 위치를 계산하여 Bin 인덱스 도출 (O(1))
+    // __builtin_clzll은 64비트 정수에서 상위 0비트 개수를 세어주는 내장 함수입니다.
+    uint64_t leading_zeros = (uint64_t)__builtin_clzll(size - 1);
+    uint32_t bit_pos = 64 - (uint32_t)leading_zeros;
+
+    // size=65~128 -> bit_pos=7 -> bin = 7 - 6 = 1
+    uint32_t bin = (bit_pos > 6) ? (bit_pos - 6) : 0;
+
+    return (bin < BIN_COUNT) ? bin : (BIN_COUNT - 1);
 }
 
-/* Forward Coalescing (안전 버전) */
-static uint64_t try_coalesce(ShmHandle *h, uint64_t block_off)
+
+#define TOTAL_BLOCK_SIZE(bh) \
+    ((bh)->size + sizeof(BlockHeader) + sizeof(BlockFooter))
+#define	SZ_BLOCKHEADER	(sizeof (BlockHeader))
+#define	SZ_BLOCKFOOTER	(sizeof (BlockFooter))
+#define	SZ_BLOCK_SIZE	(SZ_BLOCKHEADER + SZ_BLOCKFOOTER)
+
+// 1. 헤더 오프셋을 기준으로 해당 블록의 푸터 포인터를 찾아가는 매크로
+#define GET_FOOTER(h, block_off) \
+    ((BlockFooter*)((uint8_t*)OFF2PTR(h, block_off) + sizeof(BlockHeader) + ((BlockHeader*)OFF2PTR(h, block_off))->size))
+
+// 2. 현재 블록 헤더의 오프셋에 총 크기(TOTAL_BLOCK_SIZE)를 더해 다음 블록의 오프셋을 도출하는 매크로
+#define GET_NEXT_BLOCK_OFFSET(h, block_off) \
+    ((block_off) + TOTAL_BLOCK_SIZE((BlockHeader*)OFF2PTR(h, block_off)))
+
+#define GET_PREV_FOOTER(h, offset) OFF2PTR(h, (offset) - SZ_BLOCKFOOTER)
+
+#define PREV_BLOCK_OFFSET(h, offset) \
+    ((offset) - SZ_BLOCKFOOTER - ((BlockFooter*)GET_PREV_FOOTER(h,offset))->size - SZ_BLOCKHEADER)
+
+
+#if 0
+static uint32_t get_block_bin(uint64_t payload_size) {
+    return get_bin_index(payload_size + SZ_BLOCK_SIZE);
+}
+#endif
+
+/* =========================================================================
+ * [수정] remove_free_bins: 안전하게 블록 자체 플래그에 기록된 빈 인덱스 활용
+ * ========================================================================= */
+static void remove_free_bins(ShmHandle *h, uint64_t offset)
 {
-    HeapHeader *hh = core_heap_hdr(h);
-    BlockHeader *bh = (BlockHeader *)OFF2PTR(h, block_off);
+    if (offset == OFFSET_NULL) return;
 
-    uint64_t next_off = block_off + sizeof(BlockHeader) + bh->size;
-    if (next_off >= hh->heap_start + hh->heap_size)
-        return block_off;
+    HeapHeader  *hh = core_heap_hdr(h);
+    BlockHeader *bh = (BlockHeader *)OFF2PTR(h, offset);
 
-    BlockHeader *next_bh = (BlockHeader *)OFF2PTR(h, next_off);
-    if (next_bh->magic != HEAP_BLOCK_MAGIC || !GET_IS_FREE(next_bh->flags))
-        return block_off;
+    // 이 블록이 소속된 빈 인덱스 추출
+    uint32_t bin = GET_BIN_IDX(bh->flags);
+    if (bin >= BIN_COUNT) return;
 
-    /* 다음 블록 제거 (간단 linear search) */
-    uint32_t next_bin = GET_BIN_IDX(next_bh->flags);
-    uint64_t *p = &hh->free_bins[next_bin];
-    while (*p != OFFSET_NULL) {
-        if (*p == next_off) {
-            *p = next_bh->next;
-            break;
+    // 만약 리스트의 마스터 Head가 바로 이 노드라면
+    if (hh->free_bins[bin] == offset) {
+        hh->free_bins[bin] = bh->next;
+        if (bh->next != OFFSET_NULL) {
+            BlockHeader *nbh = (BlockHeader *)OFF2PTR(h, bh->next);
+            nbh->prev = OFFSET_NULL; // 다음 노드가 새로운 Head가 되므로 prev를 비워줌
         }
-        p = &((BlockHeader*)OFF2PTR(h, *p))->next;
+        // 안전을 위해 제거된 노드의 링크 초기화
+        bh->next = OFFSET_NULL;
+        bh->prev = OFFSET_NULL;
+        return;
     }
 
-    bh->size += sizeof(BlockHeader) + next_bh->size;
-    SET_BIN_IDX(bh->flags, get_bin_index(bh->size + sizeof(BlockHeader)));
+    // [CRITICAL GUARD] Head가 아님에도 bh->prev가 NULL이거나 비정상적 주소인 경우 방어
+    if (bh->prev == OFFSET_NULL || bh->prev == 18446744073709551615ULL) {
+        // 링크 구조가 이미 꼬여 역추적이 불가능하므로, 루프를 돌며 나를 가리키는 전방 노드를 직접 탐색
+        uint64_t prev_search = hh->free_bins[bin];
+        while (prev_search != OFFSET_NULL) {
+            BlockHeader *p_chk = (BlockHeader *)OFF2PTR(h, prev_search);
+            if (p_chk->next == offset) {
+                p_chk->next = bh->next;
+                if (bh->next != OFFSET_NULL) {
+                    BlockHeader *nbh = (BlockHeader *)OFF2PTR(h, bh->next);
+                    nbh->prev = prev_search;
+                }
+                break;
+            }
+            prev_search = p_chk->next;
+        }
+    } else {
+        // 일반적인 중간 노드 제거 공정 (주소 유효성 안전 검증 포함)
+        uint64_t heap_end = hh->heap_start + hh->heap_size;
+        if (bh->prev >= hh->heap_start && bh->prev < heap_end) {
+            BlockHeader *pbh = (BlockHeader *)OFF2PTR(h, bh->prev);
+            pbh->next = bh->next;
 
+            if (bh->next != OFFSET_NULL && bh->next >= hh->heap_start && bh->next < heap_end) {
+                BlockHeader *nbh = (BlockHeader *)OFF2PTR(h, bh->next);
+                nbh->prev = bh->prev;
+            }
+        }
+    }
+
+    // 제거 완료된 블록의 독성 포인터 완전 격리 폐기
+    bh->next = OFFSET_NULL;
+    bh->prev = OFFSET_NULL;
+}
+static void insert_free_bin(ShmHandle *h, uint32_t bin, uint64_t offset)
+{
+    if (offset == OFFSET_NULL || bin >= BIN_COUNT) return;
+
+    HeapHeader  *hh = core_heap_hdr(h);
+    BlockHeader *bh = (BlockHeader *)OFF2PTR(h, offset);
+
+    // 중복 삽입 무력화 가드
+    if (hh->free_bins[bin] == offset) {
+        return;
+    }
+
+    SET_BIN_IDX(bh->flags, bin);
+    SET_IS_FREE(bh->flags, 1);
+
+    // LIFO (Last-In, First-Out) 완벽한 정형 연결
+    bh->prev = OFFSET_NULL;
+    bh->next = hh->free_bins[bin];
+
+    if (hh->free_bins[bin] != OFFSET_NULL) {
+        BlockHeader *old_head = (BlockHeader *)OFF2PTR(h, hh->free_bins[bin]);
+        old_head->prev = offset; // 기존 Head의 백포인터를 나에게 연결
+    }
+
+    hh->free_bins[bin] = offset; // 힙 마스터 헤더 갱신
+}
+
+static uint64_t try_coalesce(ShmHandle *h, uint64_t block_off) {
+    HeapHeader  *hh = core_heap_hdr(h);
+    BlockHeader *bh = (BlockHeader*)OFF2PTR(h, block_off);
+
+    // 1. 전방(이전) 물리 블록 병합 처리
+    const uint64_t min_required_offset = hh->heap_start + sizeof(BlockHeader) + sizeof(BlockFooter);
+    if (block_off >= min_required_offset) {
+        uint64_t footer_off = block_off - sizeof(BlockFooter);
+        BlockFooter *prev_footer = (BlockFooter*)OFF2PTR(h, footer_off);
+
+        if (prev_footer->magic == HEAP_BLOCK_MAGIC) {
+            uint64_t prev_size = prev_footer->size;
+            if (footer_off >= (prev_size + sizeof(BlockHeader))) {
+                uint64_t prev_block_offset = footer_off - prev_size - sizeof(BlockHeader);
+
+                if (prev_block_offset >= hh->heap_start && prev_block_offset < block_off) {
+                    BlockHeader *prev_ptr = (BlockHeader*)OFF2PTR(h, prev_block_offset);
+
+                    if (prev_ptr->magic == HEAP_BLOCK_MAGIC && GET_IS_FREE(prev_ptr->flags)) {
+                        // [핵심 해결] 합쳐져서 흡수될 이전 프리 블록을 기존 리스트에서 완전히 지워줍니다!
+                        remove_free_bins(h, prev_block_offset);
+
+                        prev_ptr->size += (sizeof(BlockHeader) + bh->size + sizeof(BlockFooter));
+                        BlockFooter *footer = (BlockFooter*)((uint8_t*)OFF2PTR(h, block_off) + bh->size + sizeof(BlockHeader));
+                        footer->magic = HEAP_BLOCK_MAGIC;
+                        footer->size = prev_ptr->size;
+
+                        bh = prev_ptr;
+                        block_off = prev_block_offset;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 후방(다음) 물리 블록 병합 처리
+    uint64_t next_block_offset = block_off + bh->size + sizeof(BlockHeader) + sizeof(BlockFooter);
+    uint64_t heap_end_bound = hh->heap_start + hh->heap_size;
+
+    if (next_block_offset < heap_end_bound) {
+        BlockHeader *next_ptr = (BlockHeader*)OFF2PTR(h, next_block_offset);
+        if (next_ptr->magic == HEAP_BLOCK_MAGIC && GET_IS_FREE(next_ptr->flags)) {
+            // [핵심 해결] 합쳐져서 소멸할 다음 프리 블록도 리스트에서 깔끔하게 지워줍니다!
+            remove_free_bins(h, next_block_offset);
+
+            bh->size += next_ptr->size + sizeof(BlockHeader) + sizeof(BlockFooter);
+            BlockFooter *footer = (BlockFooter*)((uint8_t*)OFF2PTR(h, next_block_offset) + next_ptr->size + sizeof(BlockHeader));
+            footer->magic = HEAP_BLOCK_MAGIC;
+            footer->size = bh->size;
+        }
+    }
+
+    SET_IS_FREE(bh->flags, 1);
     return block_off;
 }
 
-/* heap_mutex 잡은 상태 */
 static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
 {
     if (req == 0) req = 8;
-    uint64_t need = req + sizeof(BlockHeader);
+
+    uint64_t need = req + SZ_BLOCK_SIZE;
     need = (need + ALIGN_SIZE - 1) & ~(ALIGN_SIZE - 1);
     if (need < MIN_BLOCK_SIZE) need = MIN_BLOCK_SIZE;
 
@@ -167,54 +304,81 @@ static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
 
     for (uint32_t b = bin; b < BIN_COUNT; b++) {
         uint64_t cur = hh->free_bins[b];
-        uint64_t prev = OFFSET_NULL;
+        uint32_t loop_detector = 0;
 
         while (cur != OFFSET_NULL) {
             BlockHeader *bh = (BlockHeader *)OFF2PTR(h, cur);
+            uint64_t next_offset = bh->next;
+
+            // [안전 제동 가드] 혹시나 링크가 비정상 순환될 경우 무한 루프 전면 차단
+            if (bh->next == cur || ++loop_detector > 1000) {
+                bh->next = OFFSET_NULL;
+                break;
+            }
+
             if (bh->magic != HEAP_BLOCK_MAGIC || !GET_IS_FREE(bh->flags)) {
-                prev = cur;
-                cur = bh->next;
+                cur = next_offset;
                 continue;
             }
 
-            uint64_t avail = bh->size + sizeof(BlockHeader);
+            uint64_t avail = bh->size + SZ_BLOCK_SIZE;
             if (avail >= need) {
-                /* Remove from list */
-                if (prev == OFFSET_NULL)
-                    hh->free_bins[b] = bh->next;
-                else
-                    ((BlockHeader*)OFF2PTR(h, prev))->next = bh->next;
+                // 탐색 성공 청크 완전 격리
+                remove_free_bins(h, cur);
 
+                // 분할(Split) 공정 진행
                 if (avail >= need + MIN_BLOCK_SIZE) {
+                    bh->size = need - SZ_BLOCK_SIZE;
+                    SET_IS_FREE(bh->flags, 0); // 할당 상태 명시
+
+                    BlockFooter *alloc_footer = (BlockFooter *)((uint8_t*)OFF2PTR(h, cur) + bh->size + sizeof(BlockHeader));
+                    alloc_footer->magic = HEAP_BLOCK_MAGIC;
+                    alloc_footer->size = bh->size;
+
+                    // 찌꺼기 블록 생성
                     uint64_t split_off = cur + need;
                     BlockHeader *split = (BlockHeader *)OFF2PTR(h, split_off);
-                    split->size = avail - need - sizeof(BlockHeader);
+
                     split->magic = HEAP_BLOCK_MAGIC;
+                    split->size = avail - need - SZ_BLOCK_SIZE;
+                    split->prev = OFFSET_NULL;
                     split->next = OFFSET_NULL;
+                    split->flags = 0;
                     SET_IS_FREE(split->flags, 1);
-                    uint32_t sbin = get_bin_index(split->size + sizeof(BlockHeader));
-                    SET_BIN_IDX(split->flags, sbin);
-                    split->next = hh->free_bins[sbin];
-                    hh->free_bins[sbin] = split_off;
+
+                    BlockFooter *split_footer = (BlockFooter *)((uint8_t*)OFF2PTR(h, split_off) + split->size + sizeof(BlockHeader));
+                    split_footer->magic = HEAP_BLOCK_MAGIC;
+                    split_footer->size = split->size;
+
+                    // 독립 상태에서 안전 병합 유도
+                    uint64_t coalesced_off = try_coalesce(h, split_off);
+                    BlockHeader *final_split = (BlockHeader *)OFF2PTR(h, coalesced_off);
+
+                    // 정확한 최종 크기를 활용한 인덱싱 주입
+                    uint32_t sbin = get_bin_index(final_split->size + SZ_BLOCK_SIZE);
+                    insert_free_bin(h, sbin, coalesced_off);
+
                 } else {
                     need = avail;
+                    bh->size = need - SZ_BLOCK_SIZE;
+                    SET_IS_FREE(bh->flags, 0);
+
+                    BlockFooter *f = (BlockFooter *)((uint8_t*)OFF2PTR(h, cur) + bh->size + sizeof(BlockHeader));
+                    f->size = bh->size;
+                    f->magic = HEAP_BLOCK_MAGIC;
                 }
 
-                bh->size = need - sizeof(BlockHeader);
-                SET_IS_FREE(bh->flags, 0);
-                bh->next = 0;
+                bh->next = OFFSET_NULL;
+                bh->prev = OFFSET_NULL;
 
                 hh->used_bytes += need;
                 hh->total_alloc++;
-                return cur + sizeof(BlockHeader);
+                return cur + SZ_BLOCKHEADER;
             }
-            prev = cur;
-            cur = bh->next;
+
+            cur = next_offset;
         }
     }
-
-    LOG_ERR("heap_alloc: Out of memory (req=%lu, used=%lu/%lu)",
-            req, hh->used_bytes, hh->heap_size);
     return OFFSET_NULL;
 }
 
@@ -236,19 +400,24 @@ static int heap_free_locked(ShmHandle *h, uint64_t data_off)
         return SHM_ERR;
     }
 
-    uint64_t freed_size = bh->size + sizeof(BlockHeader);
-
-    SET_IS_FREE(bh->flags, 1);
-    uint32_t bin = get_bin_index(freed_size);
-    SET_BIN_IDX(bh->flags, bin);
+    uint64_t freed_size = bh->size + sizeof(BlockHeader) + sizeof (BlockFooter);
 
     /* Coalescing */
     block_off = try_coalesce(h, block_off);
     bh = (BlockHeader *)OFF2PTR(h, block_off);
+    SET_IS_FREE(bh->flags, 1);
+    uint32_t bin = get_bin_index(bh->size + SZ_BLOCK_SIZE);
+    SET_BIN_IDX(bh->flags, bin);
+
 
     /* Insert to free list */
-    bh->next = hh->free_bins[bin = GET_BIN_IDX(bh->flags)];
+	bin = get_bin_index(bh->size + SZ_BLOCK_SIZE);
+    bh->next = hh->free_bins[bin];
+	if (bh->next != OFFSET_NULL)	{
+		((BlockHeader*)OFF2PTR(h, bh->next))->prev = block_off;
+	}
     hh->free_bins[bin] = block_off;
+
 
     if (hh->used_bytes >= freed_size)
         hh->used_bytes -= freed_size;
@@ -314,12 +483,16 @@ static void heap_init_region(ShmHandle *h, uint64_t hs, uint64_t hsz)
     hh->total_alloc = hh->total_free = hh->used_bytes = 0;
 
     BlockHeader *b = (BlockHeader *)OFF2PTR(h, hs);
-    b->size  = hsz - sizeof(BlockHeader);
+    b->size  = hsz - sizeof(BlockHeader) - sizeof (BlockFooter);
     b->magic = HEAP_BLOCK_MAGIC;
+    b->prev  = OFFSET_NULL;
     b->next  = OFFSET_NULL;
     SET_IS_FREE(b->flags, 1);
-    uint32_t bin = get_bin_index(b->size + sizeof(BlockHeader));
+    uint32_t bin = get_bin_index(b->size + SZ_BLOCK_SIZE);
     SET_BIN_IDX(b->flags, bin);
+	BlockFooter *f = (BlockFooter*)OFF2PTR(h, hs + sizeof (BlockHeader) + b->size);
+	f->size = b->size;
+	f->magic = HEAP_BLOCK_MAGIC;
     hh->free_bins[bin] = hs;
 
     LOG_INFO("Segregated Fit + Coalescing(Next only) Heap 초기화 완료 (%lu MB)", hsz >> 20);
@@ -422,7 +595,7 @@ void shm_dump_stats(ShmHandle *h)
             hh->heap_size >> 20, hh->used_bytes >> 10,
             (hh->heap_size - hh->used_bytes) >> 20,
             hh->total_alloc, hh->total_free);
-	fprintf(stderr, "Free Memory Status\n");
+	fprintf(stderr, "Free Memory Status(HeapOffset:%lu) (HeapSize:%lu)\n", hh->heap_start, hh->heap_size);
 	for (int i=0;i<BIN_COUNT;i++)	{
 		uint64_t offset = hh->free_bins[i];
 		while (offset != OFFSET_NULL)	{
