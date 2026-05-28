@@ -32,6 +32,7 @@ static inline uint64_t    *hh_field_buckets(HashHeader *hh)
 static inline SkipNode    *core_sn(ShmHandle *h, uint64_t off)
     { return (SkipNode*)OFF2PTR(h,off); }
 
+#if 0
 static inline FieldPoolHeader *get_field_pool(ShmHandle *h)	{
 	ShmHeader* s = (ShmHeader*)h->base;
 	return &s->field_pool;
@@ -40,6 +41,7 @@ static inline FieldPoolHeader *get_field_pool(ShmHandle *h)	{
 	return OFF2PTR(h,s->field_pool_offset);
 #endif
 }
+#endif
 /* ============================================================
  *  SHM 생명주기
  * ============================================================ */
@@ -49,7 +51,6 @@ void        shm_close(ShmHandle *h);
 void        shm_destroy(const char *name);
 void        shm_set_debug_level(int level);
 void        shm_dump_stats(ShmHandle *h);
-void		shm_statistics(ShmHandle *h, char *p);
 const char *shm_strerror(int err);
 
 /* ============================================================

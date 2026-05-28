@@ -99,7 +99,7 @@ uint32_t shm_field_hash(const void *f, uint32_t flen, uint32_t nb)
 
 #define ALIGN_SIZE         8
 #define MIN_BLOCK_SIZE     64
-#define BIN_COUNT          32
+#define BIN_COUNT          26
 
 static const uint64_t size_class_limits[BIN_COUNT] = {
     64, 128, 256, 512, 1024, 2048, 4096, 8192,
@@ -117,7 +117,7 @@ static const uint64_t size_class_limits[BIN_COUNT] = {
 static uint32_t get_bin_index(uint64_t size)
 {
     for (uint32_t i = 0; i < BIN_COUNT - 1; i++) {
-        if (size <= size_class_limits[i + 1])
+        if (size <= size_class_limits[i])
             return i;
     }
     return BIN_COUNT - 1;
@@ -322,7 +322,7 @@ static void heap_init_region(ShmHandle *h, uint64_t hs, uint64_t hsz)
     SET_BIN_IDX(b->flags, bin);
     hh->free_bins[bin] = hs;
 
-    LOG_INFO("Segregated Fit + Coalescing Heap 초기화 완료 (%lu MB)", hsz >> 20);
+    LOG_INFO("Segregated Fit + Coalescing(Next only) Heap 초기화 완료 (%lu MB)", hsz >> 20);
 }
 
 /* ── mutex 속성 헬퍼 (프로세스 공유 + robust) ────────────── */
@@ -422,6 +422,15 @@ void shm_dump_stats(ShmHandle *h)
             hh->heap_size >> 20, hh->used_bytes >> 10,
             (hh->heap_size - hh->used_bytes) >> 20,
             hh->total_alloc, hh->total_free);
+	fprintf(stderr, "Free Memory Status\n");
+	for (int i=0;i<BIN_COUNT;i++)	{
+		uint64_t offset = hh->free_bins[i];
+		while (offset != OFFSET_NULL)	{
+			BlockHeader *op = OFF2PTR(h, offset);
+			fprintf (stderr, "\toffset : %8lu size : %6lu\n", offset, op->size);
+			offset = op->next;
+		}
+	}
 }
 
 /* ── 버킷 ────────────────────────────────────────────────── */

@@ -38,6 +38,7 @@
 #include "cmd_hash.h"
 #include "cmd_del.h"
 #include "cmd_bset.h"
+#include "cmd_cset.h"
 
 /* ============================================================
  *  §1  타입별 drop 래퍼
@@ -230,6 +231,49 @@ static int drop_bset(ShmHandle *h, const void *key, uint32_t klen)
     return SHM_OK;
 }
 
+
+/* ── ENTRY_CSET drop ────────────────────────────────────────
+ *  청크 체인 전체 해제 (삭제 비트 무시, 모든 live offset heap_free)
+ * ─────────────────────────────────────────────────────────── */
+static int drop_cset(ShmHandle *h, const void *key, uint32_t klen)
+{
+    uint32_t     idx = shm_hash(key, klen);
+    BucketEntry *bk  = core_get_bucket(h, idx);
+    bucket_lock(h, idx);
+
+    uint64_t prev   = OFFSET_NULL;
+    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_CSET, &prev);
+    if (ne_off == OFFSET_NULL) {
+        pthread_mutex_unlock(&bk->mutex);
+        return SHM_ERR_NOT_FOUND;
+    }
+    NameEntry  *ne    = (NameEntry *)OFF2PTR(h, ne_off);
+    uint64_t    bh_off = ne->data_offset;
+    CSetHeader *bh     = (CSetHeader *)OFF2PTR(h, bh_off);
+
+    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
+    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
+    nameentry_free(h, ne_off);
+    pthread_mutex_unlock(&bk->mutex);
+
+    pthread_rwlock_wrlock(&bh->rwlock);
+    uint64_t cur_off = bh->chunk_head;
+    while (cur_off != OFFSET_NULL) {
+        CSetChunk *c = (CSetChunk *)OFF2PTR(h, cur_off);
+        uint64_t   nxt = c->next_off;
+        for (uint32_t i = 0; i < c->count; i++)
+            if (!CS_DEL_GET(c,i) && c->entries[i].offset != OFFSET_NULL)
+                heap_free(h, c->entries[i].offset);
+        heap_free(h, cur_off);
+        cur_off = nxt;
+    }
+    pthread_rwlock_unlock(&bh->rwlock);
+    pthread_rwlock_destroy(&bh->rwlock);
+    heap_free(h, bh_off);
+    LOG_TRACE("DEL(CSET): '%.*s'", klen, (const char *)key);
+    return SHM_OK;
+}
+
 /* ============================================================
  *  §2  DEL 라우팅 테이블
  *
@@ -240,6 +284,7 @@ static const DelRouteEntry g_del_route[] = {
     { ENTRY_ZSET, "ZSET", drop_zset },
     { ENTRY_HASH, "HASH", drop_hash },
     { ENTRY_BSET, "BSET", drop_bset },
+    { ENTRY_CSET, "CSET", drop_cset },
     /*
      * 향후 추가 예시:
      * { ENTRY_ZHSET, "ZHSET", drop_zhset },

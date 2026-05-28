@@ -30,7 +30,6 @@
  *  [uint32_t crc32]   ← 헤더부터 EOF 바이트까지 전체 CRC
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -243,24 +242,69 @@ static void save_hash(ShmHandle *h, RdbWriter *w,
     }
 }
 
-static void save_set(ShmHandle *h, RdbWriter *w,
+/* rdb.c 에 추가할 함수들 */
+
+#include "cmd_bset.h"
+/* BSET 저장 */
+static void save_bset(ShmHandle *h, RdbWriter *w,
                       const char *key, uint32_t klen, NameEntry *ne)
 {
-    SetHeader *sh   = (SetHeader*)OFF2PTR(h, ne->data_offset);
-    uint64_t   *bkts = (uint64_t*)(sh + 1);
-    RW_U8 (w, ENTRY_SET);
+    BSetHeader *bsh = (BSetHeader*)OFF2PTR(h, ne->data_offset);
+    if (!bsh) return;
+
+    pthread_rwlock_rdlock(&bsh->rwlock);
+
+    RW_U8(w, ENTRY_BSET);
     RW_STR(w, key, klen);
-    RW_U64(w, sh->member_count);
-    for (uint32_t i=0; i<sh->n_buckets; i++) {
-        uint64_t cur = bkts[i];
-        while (cur != OFFSET_NULL) {
-            SetEntry *se = (SetEntry*)OFF2PTR(h,cur);
-            RW_STR(w,(const char*)OFF2PTR(h,se->member_offset),se->member_len);
-            cur = se->next_offset;
-        }
+    RW_U64(w, bsh->count);
+
+    BSetEntry *entries = (BSetEntry*)OFF2PTR(h, bsh->array_offset);
+
+    for (uint64_t i = 0; i < bsh->count; i++) {
+        RW_U64(w, entries[i].score);
+        RW_STR(w, (const char*)OFF2PTR(h, entries[i].offset), entries[i].vlen);
     }
+
+    pthread_rwlock_unlock(&bsh->rwlock);
 }
 
+/* BSET 복구 */
+static int load_bset(RdbReader *r, ShmHandle *h,
+                     const char *key, uint32_t klen)
+{
+    uint64_t count = rr_u64(r);
+    if (r->err) return -1;
+
+    /* BSET 생성 */
+    string_t skey = {(char*)key, klen};
+    string_t cmd  = {"BCREATE", 7};
+    string_t *args[2] = {&cmd, &skey};
+    s_replyObject *rep = cmd_dispatch(h, args, 2);
+    reply_free(rep);
+
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t score = rr_u64(r);
+        uint32_t vlen;
+        char *value = rr_str(r, &vlen);
+        if (r->err || !value) {
+            free(value);
+            return -1;
+        }
+
+        char score_str[32];
+        snprintf(score_str, sizeof(score_str), "%llu", (unsigned long long)score);
+
+        string_t scmd = {"BSET", 4};
+        string_t sscore = {score_str, (uint32_t)strlen(score_str)};
+        string_t svalue = {value, vlen};
+
+        string_t *set_args[4] = {&scmd, &skey, &sscore, &svalue};
+        rep = cmd_dispatch(h, set_args, 4);
+        reply_free(rep);
+        free(value);
+    }
+    return 0;
+}
 /* ============================================================
  *  §6  rdb_save (포그라운드 저장)
  *
@@ -315,7 +359,7 @@ int rdb_save(RdbHandle *rdb, ShmHandle *shm)
             case ENTRY_KV:   save_kv  (shm,&w,key,klen,ne); break;
             case ENTRY_ZSET: save_zset(shm,&w,key,klen,ne); break;
             case ENTRY_HASH: save_hash(shm,&w,key,klen,ne); break;
-            case ENTRY_SET: save_set(shm,&w,key,klen,ne); break;
+            case ENTRY_BSET: save_bset(shm,&w,key,klen,ne); break;
             default: break;
             }
             cur = ne->next_offset;
@@ -433,30 +477,6 @@ static int load_hash(RdbReader *r, ShmHandle *shm,
     return r->err?-1:0;
 }
 
-static int load_set(RdbReader *r, ShmHandle *shm,
-                     const char *key, uint32_t klen)
-{
-    uint64_t cnt=rr_u64(r);
-    if (r->err) return -1;
-
-    /* HCREATE key */
-    string_t sk={key,klen},scrt={"SCREATE",7};
-    string_t *cargs[]={&scrt,&sk};
-    s_replyObject *rep=cmd_dispatch(shm,cargs,2);
-    reply_free(rep);
-
-    for (uint64_t i=0;i<cnt;i++) {
-        uint32_t memberlen; char *member=rr_str(r,&memberlen);
-        if (r->err||!member){free(member);return -1;}
-        string_t sf={member,memberlen};
-        string_t scmd={"SADD",4};
-        string_t *args[]={&scmd,&sk,&sf};
-        rep=cmd_dispatch(shm,args,3);
-        reply_free(rep);
-        free(member);
-    }
-    return r->err?-1:0;
-}
 
 /* ============================================================
  *  §8  rdb_load
@@ -521,7 +541,7 @@ int64_t rdb_load(RdbHandle *rdb, ShmHandle *shm)
         case ENTRY_KV:   rc=load_kv  (&rr,shm,key,klen);break;
         case ENTRY_ZSET: rc=load_zset(&rr,shm,key,klen);break;
         case ENTRY_HASH: rc=load_hash(&rr,shm,key,klen);break;
-        case ENTRY_SET:  rc=load_set(&rr,shm,key,klen);break;
+        case ENTRY_BSET:  rc=load_bset(&rr,shm,key,klen);break;
         default:
             fprintf(stderr,"RDB: 알 수 없는 타입 0x%02x\n",type);
             free(key);fclose(fp);return loaded;

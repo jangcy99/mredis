@@ -32,7 +32,6 @@
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
-#include <errno.h>
 
 /* ============================================================
  *  컴파일 타임 파라미터
@@ -64,7 +63,6 @@
 #define SHM_ERR_TYPE        (-8)
 #define SHM_ERR_ARGC        (-9)
 #define SHM_ERR_PARSE       (-10)
-#define SHM_ERR_INTERNAL    (-11)
 
 /* ============================================================
  *  디버그 레벨
@@ -96,14 +94,12 @@
 #define ZRANGE_DESC 1
 
 /* NameEntry 타입 */
-#define ENTRY_KV     1u
-#define ENTRY_ZSET   2u
-#define ENTRY_HASH   3u
-#define ENTRY_SET    4u
-
-#ifndef ENTRY_BSET
+#define ENTRY_KV    1u
+#define ENTRY_ZSET  2u
+#define ENTRY_HASH  3u
 #define ENTRY_BSET  5u
-#endif
+#define ENTRY_CSET  6u
+
 /* ============================================================
  *  string_t  –  길이 포함 바이트열
  * ============================================================ */
@@ -327,27 +323,10 @@ typedef struct {
 } SkipNode;
 
 typedef struct {
-    uint64_t head_offset;
-	uint64_t tail_offset;
-	uint64_t length;
-    uint32_t cur_level;
-	uint32_t pad;
+    uint64_t head_offset; uint64_t tail_offset; uint64_t length;
+    uint32_t cur_level;   uint32_t pad;
     pthread_mutex_t mutex;
 } ZSetHeader;
-
-typedef struct	{
-	uint64_t	next;
-	uint64_t	str_offset;
-	uint32_t	str_len;
-	uint32_t	ref_count;
-} FieldString;
-
-typedef struct	{
-	uint64_t field_buckets[256];
-    uint32_t total_fields;
-    uint32_t pad;
-    pthread_mutex_t mutex;
-} FieldPoolHeader;
 
 typedef struct {
     uint64_t next_offset;
@@ -365,7 +344,7 @@ typedef struct {
     /* 뒤이어 uint64_t field_buckets[n_buckets] */
 } HashHeader;
 
-#define BIN_COUNT          32
+#define BIN_COUNT          26
 
 typedef struct BlockHeader {
     uint64_t size;       /* 반드시 유지되는 데이터 크기 */
@@ -389,12 +368,10 @@ typedef struct {
     uint64_t shm_size;
 	uint64_t bucket_offset;
 	uint64_t heap_header_offset;
-//	uint64_t field_pool_offset;
     uint32_t initialized;
 	uint32_t version;
 	uint32_t hash_table_size;
 	uint32_t pad;
-	FieldPoolHeader	field_pool;
 } ShmHeader;
 
 typedef struct {
@@ -403,22 +380,4 @@ typedef struct {
 	uint64_t size;
 } ShmHandle;
 
-/* ============================================================
- *  Set (Unordered Set)
- * ============================================================ */
-typedef struct SetEntry {
-    uint64_t next_offset;
-    uint64_t member_offset;
-    uint32_t member_len;
-    uint32_t pad;
-} SetEntry;
-
-typedef struct {
-    uint64_t member_count;
-    uint32_t n_buckets;
-    uint32_t pad;
-    pthread_mutex_t mutex;
-    /* 뒤이어 uint64_t member_buckets[n_buckets] */
-} SetHeader;
 #endif /* SHM_TYPES_H */
-
