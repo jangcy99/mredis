@@ -11,6 +11,7 @@
 #include "cmd_hash.h"
 #include "cmd_keys.h"
 #include "cmd_del.h"
+#include "cmd_set.h"
 #include "cmd_bset.h"
 #include "cmd_cset.h"
 #include "cmd_dispatch.h"
@@ -78,6 +79,18 @@ static const CmdEntry g_cmd_table[] = {
     { "CPOPMAX",         cmd_cpopmax,         2, "CPOPMAX key [count]"                    },
     { "CDROP",           cmd_cdrop,           2, "CDROP key"                              },
     { "CCOMPACT",        cmd_ccompact,        2, "CCOMPACT key"                           },
+
+	/* -- SET - 집합구현 ---*/
+    { "SADD",            cmd_sadd,            3, "SADD key [memver ...]"                  },
+    { "SREM",            cmd_srem,            3, "SREM key [member ...]"                  },
+    { "SISMEMBER",       cmd_sismember,       3, "SISMEMBER key member"                   },
+    { "SCARD",           cmd_scard,           2, "SCARD key"                              },
+    { "SMEMBERS",        cmd_smembers,        2, "SMEMBERS key"                           },
+    { "SPOP",            cmd_spop,            2, "SPOP key [count]"                       },
+    { "SRANDMEMBER",     cmd_srandmember,     2, "SRANDMEMBER key"                        },
+    { "SUNION",          cmd_sunion,          3, "SUNION key [key ...]"                   },
+    { "SINTER",          cmd_sinter,          3, "SINTER key [key ...]"                   },
+    { "SDIFF",           cmd_sdiff,           3, "SDIFF key [key ...]"                    },
 };
 
 static const size_t g_cmd_count = sizeof(g_cmd_table)/sizeof(g_cmd_table[0]);

@@ -427,6 +427,234 @@ static void t10_mp(MRedisHandle *h){ SECT("10. 멀티프로세스 stress (8×500
         reply_free(r); }
     CHECK(ok,"멀티프로세스: 모든 키 정상 저장"); mredis_close(vh); }
 
+/* ============================================================
+ * §11  SET 연산 검증 : SADD / SUNION / SINTER / SDIFF 통합 테스트
+ * ============================================================ */
+static void t11_set_operations(MRedisHandle *h) {
+    SECT("11. SET 집합 연산 검증 (SADD, SUNION, SINTER, SDIFF)...");
+    int ok = 1;
+
+    // 1. 데이터 준비 (set_A = {alpha, beta}, set_B = {beta, gamma})
+    {
+        string_t c_sadd = {"SADD", 4};
+        string_t k_a = {"set_A", 5};
+        string_t m_alpha = {"alpha", 5};
+        string_t m_beta = {"beta", 4};
+        
+        string_t *a1[] = {&c_sadd, &k_a, &m_alpha, &m_beta};
+        s_replyObject *r1 = cmd_dispatch(h, a1, 4);
+        if (!r1 || r1->type != REPLY_INTEGER || r1->integer != 2) ok = 0;
+        reply_free(r1);
+
+        string_t k_b = {"set_B", 5};
+        string_t m_gamma = {"gamma", 5};
+        string_t *a2[] = {&c_sadd, &k_b, &m_beta, &m_gamma};
+        s_replyObject *r2 = cmd_dispatch(h, a2, 4);
+        if (!r2 || r2->type != REPLY_INTEGER || r2->integer != 2) ok = 0;
+        reply_free(r2);
+    }
+    CHECK(ok, "SADD를 통한 집합 초기 데이터 세팅 성공");
+
+    // 2. SUNION 테스트 (결과 집합크기: 3 -> alpha, beta, gamma)
+    {
+        string_t c_sunion = {"SUNION", 6};
+        string_t k_a = {"set_A", 5};
+        string_t k_b = {"set_B", 5};
+        string_t *a[] = {&c_sunion, &k_a, &k_b};
+        
+        s_replyObject *r = cmd_dispatch(h, a, 3);
+        if (!r || r->type != REPLY_ARRAY || r->elements != 3) {
+            ok = 0;
+        } else {
+            // 결과 항목 체크
+            int has_alpha = 0, has_beta = 0, has_gamma = 0;
+            for(uint32_t i=0; i<r->elements; i++) {
+                if(strncmp(r->element[i]->ptr, "alpha", r->element[i]->len) == 0) has_alpha = 1;
+                if(strncmp(r->element[i]->ptr, "beta", r->element[i]->len) == 0) has_beta = 1;
+                if(strncmp(r->element[i]->ptr, "gamma", r->element[i]->len) == 0) has_gamma = 1;
+            }
+            if(!has_alpha || !has_beta || !has_gamma) ok = 0;
+        }
+        reply_free(r);
+    }
+    CHECK(ok, "SUNION (합집합) 데이터 정밀 무결성 검증 통과");
+
+    // 3. SINTER 테스트 (결과 집합크기: 1 -> beta)
+    {
+        string_t c_sinter = {"SINTER", 6};
+        string_t k_a = {"set_A", 5};
+        string_t k_b = {"set_B", 5};
+        string_t *a[] = {&c_sinter, &k_a, &k_b};
+        
+        s_replyObject *r = cmd_dispatch(h, a, 3);
+        if (!r || r->type != REPLY_ARRAY || r->elements != 1) {
+            ok = 0;
+        } else {
+            if(strncmp(r->element[0]->ptr, "beta", r->element[0]->len) != 0) ok = 0;
+        }
+        reply_free(r);
+    }
+    CHECK(ok, "SINTER (교집합) 데이터 정밀 무결성 검증 통과");
+
+    // 4. SDIFF 테스트 (set_A - set_B = {alpha})
+    {
+        string_t c_sdiff = {"SDIFF", 5};
+        string_t k_a = {"set_A", 5};
+        string_t k_b = {"set_B", 5};
+        string_t *a[] = {&c_sdiff, &k_a, &k_b};
+        
+        s_replyObject *r = cmd_dispatch(h, a, 3);
+        if (!r || r->type != REPLY_ARRAY || r->elements != 1) {
+            ok = 0;
+        } else {
+            if(strncmp(r->element[0]->ptr, "alpha", r->element[0]->len) != 0) ok = 0;
+        }
+        reply_free(r);
+    }
+    CHECK(ok, "SDIFF (차집합) 데이터 정밀 무결성 검증 통과");
+}
+/* ============================================================
+ * [§11] SET 명령어 세트 완전 검증 (SADD, SREM, SISMEMBER 등)
+ * ============================================================ */
+static void t11_set_suite(MRedisHandle *h) {
+    SECT("12. SET 풀 명령어 세트 및 집합 연산 정밀 검증...\n");
+    int ok = 1;
+
+    // 테스트용 명령어 이름 및 Key, Member 정의
+    string_t c_sadd = {"SADD", 4}, c_srem = {"SREM", 4}, c_sismember = {"SISMEMBER", 9};
+    string_t c_scard = {"SCARD", 5}, c_smembers = {"SMEMBERS", 8}, c_spop = {"SPOP", 4};
+    string_t c_srand = {"SRANDMEMBER", 11};
+    string_t c_sunion = {"SUNION", 6}, c_sinter = {"SINTER", 6}, c_sdiff = {"SDIFF", 5};
+
+    string_t k_set1 = {"myset1", 6}, k_set2 = {"myset2", 6};
+    string_t m_A = {"alpha", 5}, m_B = {"beta", 4}, m_C = {"gamma", 5}, m_D = {"delta", 5};
+
+    /* 1. SADD 멤버 추가 및 중복 추가 방증 테스트 */
+    {
+        // myset1에 alpha, beta 추가 (예상 반환: 2)
+        string_t *a1[] = {&c_sadd, &k_set1, &m_A, &m_B};
+        s_replyObject *r1 = cmd_dispatch(h, a1, 4);
+        if (!r1 || r1->type != REPLY_INTEGER || r1->integer != 2) ok = 0;
+        reply_free(r1);
+
+        // 동일 멤버 중복 추가 시도 (예상 반환: 0 - 추가 안 됨)
+        string_t *a2[] = {&c_sadd, &k_set1, &m_A};
+        s_replyObject *r2 = cmd_dispatch(h, a2, 3);
+        if (!r2 || r2->type != REPLY_INTEGER || r2->integer != 0) ok = 0;
+        reply_free(r2);
+    }
+    CHECK(ok, "SADD 신규 추가 및 중복 필터링 기전 검증 통과");
+
+    /* 2. SISMEMBER 및 SCARD 검증 */
+    {
+        // 존재 여부 확인 (alpha -> 1, delta -> 0)
+        string_t *a1[] = {&c_sismember, &k_set1, &m_A};
+        s_replyObject *r1 = cmd_dispatch(h, a1, 3);
+        if (!r1 || r1->type != REPLY_INTEGER || r1->integer != 1) ok = 0;
+        reply_free(r1);
+
+        string_t *a2[] = {&c_sismember, &k_set1, &m_D};
+        s_replyObject *r2 = cmd_dispatch(h, a2, 3);
+        if (!r2 || r2->type != REPLY_INTEGER || r2->integer != 0) ok = 0;
+        reply_free(r2);
+
+        // 원소 개수 확인 (2개)
+        string_t *a3[] = {&c_scard, &k_set1};
+        s_replyObject *r3 = cmd_dispatch(h, a3, 2);
+        if (!r3 || r3->type != REPLY_INTEGER || r3->integer != 2) ok = 0;
+        reply_free(r3);
+    }
+    CHECK(ok, "SISMEMBER 및 SCARD 데이터 정밀 매칭 완벽");
+
+    /* 3. SRANDMEMBER 및 SMEMBERS 조회 검증 */
+    {
+        // 전체 멤버 가져오기
+        string_t *a1[] = {&c_smembers, &k_set1};
+        s_replyObject *r1 = cmd_dispatch(h, a1, 2);
+        if (!r1 || r1->type != REPLY_ARRAY || r1->elements != 2) {
+            ok = 0;
+        } else {
+            int has_A = 0, has_B = 0;
+            if (strncmp(r1->element[0]->ptr, "alpha", r1->element[0]->len) == 0 ||
+                strncmp(r1->element[1]->ptr, "alpha", r1->element[1]->len) == 0) has_A = 1;
+            if (strncmp(r1->element[0]->ptr, "beta",  r1->element[0]->len) == 0 ||
+                strncmp(r1->element[1]->ptr, "beta",  r1->element[1]->len) == 0) has_B = 1;
+            if (!has_A || !has_B) ok = 0;
+        }
+        reply_free(r1);
+
+        // 랜덤 원소 단일 추출 검증 (Set을 손상시키지 않고 리턴만 해야 함)
+        string_t *a2[] = {&c_srand, &k_set1};
+        s_replyObject *r2 = cmd_dispatch(h, a2, 2);
+        if (!r2 || (r2->type != REPLY_STRING && r2->type != REPLY_STATUS)) ok = 0;
+        reply_free(r2);
+    }
+    CHECK(ok, "SMEMBERS 전수 스캔 및 SRANDMEMBER 랜덤 조회 성공");
+
+    /* 4. SUNION, SINTER, SDIFF 집합 연산 검증 */
+    {
+        // 비교를 위한 두 번째 세트 생성 (myset2 = {beta, gamma})
+        string_t *a_init[] = {&c_sadd, &k_set2, &m_B, &m_C};
+        s_replyObject *r_init = cmd_dispatch(h, a_init, 4);
+        reply_free(r_init);
+
+        // 합집합: myset1 ∪ myset2 = {alpha, beta, gamma} (3개)
+        string_t *a_uni[] = {&c_sunion, &k_set1, &k_set2};
+        s_replyObject *r_uni = cmd_dispatch(h, a_uni, 3);
+        if (!r_uni || r_uni->type != REPLY_ARRAY || r_uni->elements != 3) ok = 0;
+        reply_free(r_uni);
+
+        // 교집합: myset1 ∩ myset2 = {beta} (1개)
+        string_t *a_inter[] = {&c_sinter, &k_set1, &k_set2};
+        s_replyObject *r_inter = cmd_dispatch(h, a_inter, 3);
+        if (!r_inter || r_inter->type != REPLY_ARRAY || r_inter->elements != 1) {
+            ok = 0;
+        } else {
+            if (strncmp(r_inter->element[0]->ptr, "beta", r_inter->element[0]->len) != 0) ok = 0;
+        }
+        reply_free(r_inter);
+
+        // 차집합: myset1 - myset2 = {alpha} (1개)
+        string_t *a_diff[] = {&c_sdiff, &k_set1, &k_set2};
+        s_replyObject *r_diff = cmd_dispatch(h, a_diff, 3);
+        if (!r_diff || r_diff->type != REPLY_ARRAY || r_diff->elements != 1) {
+            ok = 0;
+        } else {
+            if (strncmp(r_diff->element[0]->ptr, "alpha", r_diff->element[0]->len) != 0) ok = 0;
+        }
+        reply_free(r_diff);
+    }
+    CHECK(ok, "SUNION / SINTER / SDIFF 다중 집합 연산 무결성 획득");
+
+    /* 5. SPOP 및 SREM 데이터 소멸 및 힙 메모리 해제 검증 */
+    {
+        // SPOP 실행 (원소 하나를 제거 후 반환해야 함)
+        string_t *a1[] = {&c_spop, &k_set1};
+        s_replyObject *r1 = cmd_dispatch(h, a1, 2);
+        if (!r1 || (r1->type != REPLY_STRING && r1->type != REPLY_STATUS)) ok = 0;
+        reply_free(r1);
+
+        // SCARD 확인 (1개 남아있어야 함)
+        string_t *a2[] = {&c_scard, &k_set1};
+        s_replyObject *r2 = cmd_dispatch(h, a2, 2);
+        if (!r2 || r2->type != REPLY_INTEGER || r2->integer != 1) ok = 0;
+        reply_free(r2);
+
+        // SREM을 이용하여 남은 마지막 원소까지 완전 청소
+        // 팝되고 남은 원소가 alpha인지 beta인지 모르므로 둘 다 타겟팅하여 삭제 명령 전달
+        string_t *a3[] = {&c_srem, &k_set1, &m_A, &m_B};
+        s_replyObject *r3 = cmd_dispatch(h, a3, 4);
+        if (!r3 || r3->type != REPLY_INTEGER || r3->integer != 1) ok = 0;
+        reply_free(r3);
+
+        // 이제 비어있어야 함 (SCARD -> 0)
+        string_t *a4[] = {&c_scard, &k_set1};
+        s_replyObject *r4 = cmd_dispatch(h, a4, 2);
+        if (!r4 || r4->type != REPLY_INTEGER || r4->integer != 0) ok = 0;
+        reply_free(r4);
+    }
+    CHECK(ok, "SPOP 및 SREM 연산 후 내부 오프셋 클린업 및 가비지 해제 확인");
+}
 /* ── main ───────────────────────────────────────────────── */
 int main(void) {
     printf("╔══════════════════════════════════════════════╗\n");
@@ -439,18 +667,21 @@ int main(void) {
     t01_kv(h); t02_keys(h); t03_del(h); t04_zset(h); t05_hash(h);
     t06_bset(h); t07_cset(h); t08_serialize(h); t09_zincrby(h); t10_mp(h);
 
-#if 1
+	t11_set_operations(h);
+
+	t11_set_suite(h);
 	s_replyObject *r = run(h, "KEYS", "*", NULL);
 	for (size_t i=0;i<r->elements;i++)	{
-		printf ("%s\n", (char*)r->element[i]->ptr);
 #if 0
+		printf ("%s\n", (char*)r->element[i]->ptr);
+#else
 		reply_free(run(h, "DEL", r->element[i]->ptr, NULL));
 #endif
 	}
 	reply_free(r);
-#endif
 
 	mredis_dump_stats(h);
+    mredis_set_debug_level(DBG_INFO);
     mredis_close(h);
 //	mredis_destroy(SHM_NAME);
     printf("\n══════════════════════════════════════════════\n");

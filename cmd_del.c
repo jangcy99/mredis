@@ -38,6 +38,7 @@
 #include "cmd_zset.h"
 #include "cmd_hash.h"
 #include "cmd_del.h"
+#include "cmd_set.h"
 #include "cmd_bset.h"
 #include "cmd_cset.h"
 
@@ -67,15 +68,15 @@ static DelRouteEntry g_del_route[64] = {
     { ENTRY_BSET, "BSET", drop_bset },
     { ENTRY_CSET, "CSET", drop_cset },
     { ENTRY_ZSET, "ZSET", drop_zset },
+    { ENTRY_SET,  "SET",  drop_set  },
     /*
      * 향후 추가 예시:
      * { ENTRY_ZHSET, "ZHSET", drop_zhset },
      * { ENTRY_LIST,  "LIST",  drop_list  },
-     * { ENTRY_SET,   "SET",   drop_set   },
      */
 };
 
-static size_t g_del_route_count = 5;
+static size_t g_del_route_count = 6;
 
 const DelRouteEntry *del_route_table_get(size_t *out_count)
 {

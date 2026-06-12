@@ -71,6 +71,7 @@ pubsub: test_pubsub
 
 # ── 운영 서버 ────────────────────────────────────────────
 prod: resp_server
+
 resp_server: $(ALL_SRCS) resp_server.c $(HDRS)
 	$(CC) $(CFLAGS) $(PROD_DEFS) -o $@ \
 	    $(ALL_SRCS) resp_server.c $(LDFLAGS)
