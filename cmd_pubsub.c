@@ -28,8 +28,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_pubsub.h"
 
 static PubSubCallback g_callback  = NULL;
@@ -63,14 +63,14 @@ static inline void ph_lock(PublishHeader *ph)
  * [B1] flag==0 일 때 bucket_lock 해제 후 반환
  * [B2] channel/pid 할당 실패 시 ph_off 포함 전체 롤백
  * ============================================================ */
-uint64_t find_or_create_channel_header(ShmHandle *h,
+uint64_t find_or_create_channel_header(MRedisHandle *h,
                                                const char *channel,
                                                uint32_t    clen,
                                                int         flag)
 {
     if (!h || clen == 0) return OFFSET_NULL;
 
-    uint32_t     idx = shm_hash(channel, clen);
+    uint32_t     idx = mredis_hash(channel, clen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk  = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -139,11 +139,11 @@ uint64_t find_or_create_channel_header(ShmHandle *h,
  *        (PublishEntry 큐는 bucket_lock 구간 밖에서 해제)
  * [B4]  ne 포인터를 지역변수로 복사 후 bucket unlock
  * ============================================================ */
-static void erase_channel(ShmHandle *h, const char *channel, uint32_t clen)
+static void erase_channel(MRedisHandle *h, const char *channel, uint32_t clen)
 {
     if (!h || clen == 0) return;
 
-    uint32_t     idx = shm_hash(channel, clen);
+    uint32_t     idx = mredis_hash(channel, clen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk  = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -205,7 +205,7 @@ static void erase_channel(ShmHandle *h, const char *channel, uint32_t clen)
  * [B7]  delete 전 ph->mutex 반드시 해제
  * [B8]  sival_ptr ↔ uint64_t: memcpy 사용
  * ============================================================ */
-s_replyObject *cmd_publish(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_publish(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3)
         return reply_error(SHM_ERR_ARGC, "usage: PUBLISH channel message");
@@ -290,7 +290,7 @@ s_replyObject *cmd_publish(ShmHandle *h, string_t *args[], uint32_t argc)
  * [B9]  배열 확장 후 pids 포인터 재조회
  * [B10] ph->pidcnt 를 mutex 구간 내에서만 참조
  * ============================================================ */
-s_replyObject *cmd_subscribe(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_subscribe(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2)
         return reply_error(SHM_ERR_ARGC, "usage: SUBSCRIBE channel [...]");
@@ -353,7 +353,7 @@ s_replyObject *cmd_subscribe(ShmHandle *h, string_t *args[], uint32_t argc)
  * [B11] ph->mutex 해제 후 erase_channel 호출 (이중 bucket_lock 방지)
  * [B12] erase 여부만 판단, 해제 후 ph 역참조 없음
  * ============================================================ */
-s_replyObject *cmd_unsubscribe(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_unsubscribe(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2)
         return reply_error(SHM_ERR_ARGC, "usage: UNSUBSCRIBE channel [...]");
@@ -400,7 +400,7 @@ s_replyObject *cmd_unsubscribe(ShmHandle *h, string_t *args[], uint32_t argc)
  * [B13] pe->readcnt 감소 시 ph->mutex 보호
  * [B14] head_offset 갱신을 ph->mutex 구간 내 수행
  * ============================================================ */
-s_replyObject *pubsub_handle_event(ShmHandle *h, int signalfd_fd)
+s_replyObject *pubsub_handle_event(MRedisHandle *h, int signalfd_fd)
 {
     if (signalfd_fd < 0 || !h)
         return reply_error(SHM_ERR_INVAL, "invalid signalfd");
@@ -465,12 +465,12 @@ s_replyObject *pubsub_handle_event(ShmHandle *h, int signalfd_fd)
  *        erase_channel 이 내부에서 bucket_lock 을 잡으므로
  *        cleanup 에서는 bucket_lock 없이 채널 이름을 수집 후 삭제
  * ============================================================ */
-void pubsub_cleanup(ShmHandle *h)
+void pubsub_cleanup(MRedisHandle *h)
 {
     if (!h) return;
     LOG_TRACE("[PubSub] cleanup 시작");
 
-    ShmHeader *shdr = core_shm_hdr(h);
+    MRedisHeader *shdr = core_mredis_hdr(h);
     uint32_t cleaned = 0;
 
     for (uint32_t i = 0; i < shdr->hash_table_size; i++) {

@@ -21,13 +21,13 @@
 #include <fcntl.h>
 #include <math.h>
 
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_dispatch.h"
 #include "rdb.h"
 
-#define SHM_A    "/shm_rdb_test_a"
-#define SHM_B    "/shm_rdb_test_b"
+#define SHM_A    "/mredis_rdb_test_a"
+#define SHM_B    "/mredis_rdb_test_b"
 #define RDB_F    "/tmp/test_mredis.rdb"
 
 #define PASS     "\033[32m[PASS]\033[0m"
@@ -39,7 +39,7 @@ static int g_pass = 0, g_fail = 0;
                        else {printf(FAIL " %s [L%d]\n",(m),__LINE__);g_fail++;}}while(0)
 
 /* ── cmd_dispatch 래퍼 ─────────────────────────────────── */
-static s_replyObject *run(ShmHandle *h, ...)
+static s_replyObject *run(MRedisHandle *h, ...)
 {
     string_t *args[64]; string_t bufs[64]; uint32_t argc = 0;
     va_list ap; va_start(ap, h);
@@ -63,10 +63,10 @@ static int is_nil(s_replyObject *r)
     { return r && r->type==REPLY_NIL; }
 
 /* SHM 쌍 + RDB 로 save/load 반복 테스트 공통 픽스처 */
-static ShmHandle *make_shm(const char *name)
+static MRedisHandle *make_shm(const char *name)
 {
-    shm_destroy(name);
-    return shm_create(name, 1024ULL * 1024 * 1024);
+    mredis_destroy(name);
+    return mredis_create(name, 1024ULL * 1024 * 1024);
 }
 
 /* ── 01 KV save → load ─────────────────────────────────── */
@@ -75,7 +75,7 @@ static void t01(void)
     SECT("01. KV save → load");
     unlink(RDB_F);
 
-    ShmHandle *ha = make_shm(SHM_A);
+    MRedisHandle *ha = make_shm(SHM_A);
     s_replyObject *r;
     r = run(ha,"SET","name","Alice",NULL);  reply_free(r);
     r = run(ha,"SET","city","Seoul",NULL);  reply_free(r);
@@ -84,10 +84,10 @@ static void t01(void)
     RdbHandle *rdb = rdb_open(RDB_F);
     CHECK(rdb_save(rdb, ha) == SHM_OK, "rdb_save OK");
     rdb_close(rdb);
-    shm_close(ha); shm_destroy(SHM_A);
+    mredis_close(ha); mredis_destroy(SHM_A);
 
     /* 복구 */
-    ShmHandle *hb  = make_shm(SHM_B);
+    MRedisHandle *hb  = make_shm(SHM_B);
     RdbHandle *rdb2 = rdb_open(RDB_F);
     int64_t cnt = rdb_load(rdb2, hb);
     CHECK(cnt == 3, "load 키 수=3");
@@ -98,7 +98,7 @@ static void t01(void)
     r = run(hb,"GET","nokey",NULL); CHECK(is_nil(r), "GET 없는 key → NIL"); reply_free(r);
 
     rdb_close(rdb2);
-    shm_close(hb); shm_destroy(SHM_B);
+    mredis_close(hb); mredis_destroy(SHM_B);
 }
 
 /* ── 02 ZSET save → load ───────────────────────────────── */
@@ -107,7 +107,7 @@ static void t02(void)
     SECT("02. ZSET save → load");
     unlink(RDB_F);
 
-    ShmHandle *ha = make_shm(SHM_A);
+    MRedisHandle *ha = make_shm(SHM_A);
     s_replyObject *r;
     r = run(ha,"ZADD","scores","100","Alice",NULL); reply_free(r);
     r = run(ha,"ZADD","scores","200","Bob",  NULL); reply_free(r);
@@ -116,9 +116,9 @@ static void t02(void)
     RdbHandle *rdb = rdb_open(RDB_F);
     CHECK(rdb_save(rdb, ha) == SHM_OK, "rdb_save OK");
     rdb_close(rdb);
-    shm_close(ha); shm_destroy(SHM_A);
+    mredis_close(ha); mredis_destroy(SHM_A);
 
-    ShmHandle *hb   = make_shm(SHM_B);
+    MRedisHandle *hb   = make_shm(SHM_B);
     RdbHandle *rdb2 = rdb_open(RDB_F);
     int64_t cnt = rdb_load(rdb2, hb);
     CHECK(cnt == 1, "load 키 수=1 (zset 1개)");
@@ -140,7 +140,7 @@ static void t02(void)
     r = run(hb,"ZRANK","scores","Bob",  NULL); CHECK(is_int(r,2),"ZRANK Bob=2");   reply_free(r);
 
     rdb_close(rdb2);
-    shm_close(hb); shm_destroy(SHM_B);
+    mredis_close(hb); mredis_destroy(SHM_B);
 }
 
 /* ── 03 HASH save → load ───────────────────────────────── */
@@ -149,7 +149,7 @@ static void t03(void)
     SECT("03. HASH save → load");
     unlink(RDB_F);
 
-    ShmHandle *ha = make_shm(SHM_A);
+    MRedisHandle *ha = make_shm(SHM_A);
     s_replyObject *r;
     r = run(ha,"HSET","user","name","Alice","age","30","city","Seoul",NULL); reply_free(r);
     r = run(ha,"HSET","cfg","debug","1","maxmem","256",NULL);               reply_free(r);
@@ -157,9 +157,9 @@ static void t03(void)
     RdbHandle *rdb = rdb_open(RDB_F);
     CHECK(rdb_save(rdb, ha) == SHM_OK, "rdb_save OK");
     rdb_close(rdb);
-    shm_close(ha); shm_destroy(SHM_A);
+    mredis_close(ha); mredis_destroy(SHM_A);
 
-    ShmHandle *hb   = make_shm(SHM_B);
+    MRedisHandle *hb   = make_shm(SHM_B);
     RdbHandle *rdb2 = rdb_open(RDB_F);
     int64_t cnt = rdb_load(rdb2, hb);
     CHECK(cnt == 2, "load 키 수=2 (hash 2개)");
@@ -171,7 +171,7 @@ static void t03(void)
     r = run(hb,"HGET","cfg","maxmem",NULL); CHECK(is_str(r,"256"),   "HGET maxmem=256");  reply_free(r);
 
     rdb_close(rdb2);
-    shm_close(hb); shm_destroy(SHM_B);
+    mredis_close(hb); mredis_destroy(SHM_B);
 }
 
 /* ── 04 혼합 KV+ZSET+HASH ──────────────────────────────── */
@@ -180,7 +180,7 @@ static void t04(void)
     SECT("04. 혼합 KV+ZSET+HASH save → load");
     unlink(RDB_F);
 
-    ShmHandle *ha = make_shm(SHM_A);
+    MRedisHandle *ha = make_shm(SHM_A);
     s_replyObject *r;
 
     /* KV */
@@ -198,9 +198,9 @@ static void t04(void)
     RdbHandle *rdb = rdb_open(RDB_F);
     CHECK(rdb_save(rdb, ha) == SHM_OK, "혼합 rdb_save OK");
     rdb_close(rdb);
-    shm_close(ha); shm_destroy(SHM_A);
+    mredis_close(ha); mredis_destroy(SHM_A);
 
-    ShmHandle *hb   = make_shm(SHM_B);
+    MRedisHandle *hb   = make_shm(SHM_B);
     RdbHandle *rdb2 = rdb_open(RDB_F);
     int64_t cnt = rdb_load(rdb2, hb);
     CHECK(cnt == 4, "혼합 load 키 수=4");
@@ -214,7 +214,7 @@ static void t04(void)
     r = run(hb,"ZRANK","rank","user_c",NULL); CHECK(is_int(r,2),"ZRANK user_c=2"); reply_free(r);
 
     rdb_close(rdb2);
-    shm_close(hb); shm_destroy(SHM_B);
+    mredis_close(hb); mredis_destroy(SHM_B);
 }
 
 /* ── 05 CRC 손상 감지 ──────────────────────────────────── */
@@ -223,12 +223,12 @@ static void t05(void)
     SECT("05. CRC-32 파일 손상 감지");
     unlink(RDB_F);
 
-    ShmHandle *ha = make_shm(SHM_A);
+    MRedisHandle *ha = make_shm(SHM_A);
     s_replyObject *r = run(ha,"SET","k","v",NULL); reply_free(r);
     RdbHandle *rdb   = rdb_open(RDB_F);
     rdb_save(rdb, ha);
     rdb_close(rdb);
-    shm_close(ha); shm_destroy(SHM_A);
+    mredis_close(ha); mredis_destroy(SHM_A);
 
     /* 파일 중간 1바이트 훼손 */
     struct stat st; stat(RDB_F, &st);
@@ -240,7 +240,7 @@ static void t05(void)
 
     /* load 시 CRC 불일치 경고가 출력되어야 하고,
      * 프로세스가 종료되지 않아야 한다. */
-    ShmHandle *hb   = make_shm(SHM_B);
+    MRedisHandle *hb   = make_shm(SHM_B);
     RdbHandle *rdb2 = rdb_open(RDB_F);
     int64_t cnt = rdb_load(rdb2, hb); /* 경고 출력 후 cnt >= 0 */
     CHECK(1, "CRC 불일치 시 프로세스 정상 유지");
@@ -248,7 +248,7 @@ static void t05(void)
     (void)cnt;
 
     rdb_close(rdb2);
-    shm_close(hb); shm_destroy(SHM_B);
+    mredis_close(hb); mredis_destroy(SHM_B);
 }
 
 /* ── 06 헤더 매직 검증 ─────────────────────────────────── */
@@ -262,13 +262,13 @@ static void t06(void)
     { ssize_t _w = write(fd, garbage, strlen(garbage)); (void)_w; }
     close(fd);
 
-    ShmHandle *hb   = make_shm(SHM_B);
+    MRedisHandle *hb   = make_shm(SHM_B);
     RdbHandle *rdb2 = rdb_open(RDB_F);
     int64_t cnt = rdb_load(rdb2, hb);
     CHECK(cnt < 0, "잘못된 매직 → load 실패(음수)");
 
     rdb_close(rdb2);
-    shm_close(hb); shm_destroy(SHM_B);
+    mredis_close(hb); mredis_destroy(SHM_B);
     unlink(RDB_F);
 }
 
@@ -278,7 +278,7 @@ static void t07(void)
     SECT("07. BGSAVE → waitpid → load");
     unlink(RDB_F);
 
-    ShmHandle *ha = make_shm(SHM_A);
+    MRedisHandle *ha = make_shm(SHM_A);
     s_replyObject *r;
     for (int i = 0; i < 10; i++) {
         char k[16], v[16];
@@ -306,10 +306,10 @@ static void t07(void)
     CHECK(stat(RDB_F, &st) == 0 && st.st_size > 0, "RDB 파일 생성됨");
 
     rdb_close(rdb);
-    shm_close(ha); shm_destroy(SHM_A);
+    mredis_close(ha); mredis_destroy(SHM_A);
 
     /* 복구 */
-    ShmHandle *hb   = make_shm(SHM_B);
+    MRedisHandle *hb   = make_shm(SHM_B);
     RdbHandle *rdb2 = rdb_open(RDB_F);
     int64_t cnt = rdb_load(rdb2, hb);
     CHECK(cnt == 11, "BGSAVE 복구 키=11 (10 KV + 1 ZSET)");
@@ -318,7 +318,7 @@ static void t07(void)
     r = run(hb,"ZCARD","zk",NULL);    CHECK(is_int(r,3),      "ZCARD zk=3");    reply_free(r);
 
     rdb_close(rdb2);
-    shm_close(hb); shm_destroy(SHM_B);
+    mredis_close(hb); mredis_destroy(SHM_B);
 }
 
 /* ── 08 대량 키 (1000개) ───────────────────────────────── */
@@ -327,7 +327,7 @@ static void t08(void)
     SECT("08. 대량 키 1000개 save → load");
     unlink(RDB_F);
 
-    ShmHandle *ha = make_shm(SHM_A);
+    MRedisHandle *ha = make_shm(SHM_A);
     s_replyObject *r;
 
     /* KV 500 개 */
@@ -362,9 +362,9 @@ static void t08(void)
     int rc = rdb_save(rdb, ha);
     CHECK(rc == SHM_OK, "대량 rdb_save OK");
     rdb_close(rdb);
-    shm_close(ha); shm_destroy(SHM_A);
+    mredis_close(ha); mredis_destroy(SHM_A);
 
-    ShmHandle *hb   = make_shm(SHM_B);
+    MRedisHandle *hb   = make_shm(SHM_B);
     RdbHandle *rdb2 = rdb_open(RDB_F);
     int64_t cnt = rdb_load(rdb2, hb);
     CHECK(cnt == 520, "대량 load 키=520 (500+10+10)");
@@ -376,7 +376,7 @@ static void t08(void)
     r = run(hb,"ZCARD","zset:9",NULL);CHECK(is_int(r,5),          "ZCARD zset:9=5"); reply_free(r);
 
     rdb_close(rdb2);
-    shm_close(hb); shm_destroy(SHM_B);
+    mredis_close(hb); mredis_destroy(SHM_B);
 }
 
 /* ── 09 rdb_stats ──────────────────────────────────────── */
@@ -385,7 +385,7 @@ static void t09(void)
     SECT("09. rdb_stats");
     unlink(RDB_F);
 
-    ShmHandle *ha = make_shm(SHM_A);
+    MRedisHandle *ha = make_shm(SHM_A);
     s_replyObject *r = run(ha,"SET","x","1",NULL); reply_free(r);
 
     RdbHandle *rdb = rdb_open(RDB_F);
@@ -399,7 +399,7 @@ static void t09(void)
     CHECK(strstr(buf,"OK") != NULL,         "stats 상태=OK");
 
     rdb_close(rdb);
-    shm_close(ha); shm_destroy(SHM_A);
+    mredis_close(ha); mredis_destroy(SHM_A);
     unlink(RDB_F);
 }
 
@@ -412,8 +412,8 @@ int main(void)
     printf("║     RDB 통합 테스트 (9 cases)        ║\n");
     printf("╚══════════════════════════════════════╝\n");
 
-    shm_set_debug_level(DBG_ERROR);
-    shm_destroy(SHM_A); shm_destroy(SHM_B);
+    mredis_set_debug_level(DBG_ERROR);
+    mredis_destroy(SHM_A); mredis_destroy(SHM_B);
     unlink(RDB_F);
 
     t01(); t02(); t03(); t04();

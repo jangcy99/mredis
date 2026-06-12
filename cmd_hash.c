@@ -22,12 +22,20 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_hash.h"
 
+static inline uint64_t    *hh_field_buckets(HashHeader *hh) { return (uint64_t*)((uint8_t*)hh+sizeof(HashHeader)); }
+
+static HashHeader *core_hash_get(MRedisHandle *h, const void *key, uint32_t klen)
+{
+    uint64_t ne = bucket_find(h, mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size, key, klen, ENTRY_HASH, NULL);
+    if (ne == OFFSET_NULL) return NULL;
+    return (HashHeader *)OFF2PTR(h, ((NameEntry *)OFF2PTR(h, ne))->data_offset);
+}
 /* ── 키 타입 검사 (버킷 잠긴 상태) ──────────────────────── */
-static int hash_type_check(ShmHandle *h, BucketEntry *bk,
+static int hash_type_check(MRedisHandle *h, BucketEntry *bk,
                              const void *key, uint32_t klen,
                              uint64_t *out_ne)
 {
@@ -55,7 +63,7 @@ static void hh_mutex_init(pthread_mutex_t *m)
     pthread_mutexattr_destroy(&ma);
 }
 
-static uint64_t hashheader_new(ShmHandle *h, uint32_t nb)
+static uint64_t hashheader_new(MRedisHandle *h, uint32_t nb)
 {
     uint64_t off = heap_alloc(h, hh_alloc_size(nb));
     if (off == OFFSET_NULL) return OFFSET_NULL;
@@ -69,12 +77,12 @@ static uint64_t hashheader_new(ShmHandle *h, uint32_t nb)
 }
 
 /* ── field 탐색 (HashHeader mutex 잠긴 상태) ────────────── */
-static uint64_t field_find_locked(ShmHandle *h, HashHeader *hh,
+static uint64_t field_find_locked(MRedisHandle *h, HashHeader *hh,
                                    const void *field, uint32_t flen,
                                    uint64_t *out_prev)
 {
     uint64_t *bkts = hh_field_buckets(hh);
-    uint32_t  bi   = shm_field_hash(field, flen, hh->n_buckets);
+    uint32_t  bi   = mredis_field_hash(field, flen, hh->n_buckets);
     uint64_t  prev = OFFSET_NULL, cur = bkts[bi];
     while (cur != OFFSET_NULL) {
         FieldEntry *fe = (FieldEntry *)OFF2PTR(h, cur);
@@ -90,14 +98,14 @@ static uint64_t field_find_locked(ShmHandle *h, HashHeader *hh,
 }
 
 /* ── HashHeader 얻기, 없으면 자동 생성 ─────────────────── */
-static HashHeader *hash_get_or_create(ShmHandle *h,
+static HashHeader *hash_get_or_create(MRedisHandle *h,
                                        const void *key, uint32_t klen,
                                        int *err_out)
 {
     HashHeader *hh = core_hash_get(h, key, klen);
     if (hh) { if (err_out) *err_out = SHM_OK; return hh; }
 
-    uint32_t     idx = shm_hash(key, klen);
+    uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk  = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -138,7 +146,7 @@ static HashHeader *hash_get_or_create(ShmHandle *h,
 }
 
 /* ── 모든 field 해제 (HashHeader mutex 잠긴 상태) ────────── */
-static void hash_drop_fields_locked(ShmHandle *h, HashHeader *hh)
+static void hash_drop_fields_locked(MRedisHandle *h, HashHeader *hh)
 {
     uint64_t *bkts = hh_field_buckets(hh);
     for (uint32_t i = 0; i < hh->n_buckets; i++) {
@@ -157,13 +165,13 @@ static void hash_drop_fields_locked(ShmHandle *h, HashHeader *hh)
 }
 
 /* ── HCREATE ─────────────────────────────────────────────── */
-s_replyObject *cmd_hcreate(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hcreate(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: HCREATE key");
     const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
     if (klen == 0) return reply_error(SHM_ERR_INVAL, "key 비어있음");
 
-    uint32_t     idx = shm_hash(key, klen);
+    uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk  = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -171,14 +179,14 @@ s_replyObject *cmd_hcreate(ShmHandle *h, string_t *args[], uint32_t argc)
     int chk = hash_type_check(h, bk, key, klen, &ne_off);
     if (chk == SHM_ERR_KEY_EXISTS) {
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_KEY_EXISTS, shm_strerror(SHM_ERR_KEY_EXISTS));
+        return reply_error(SHM_ERR_KEY_EXISTS, mredis_strerror(SHM_ERR_KEY_EXISTS));
     }
     if (chk == 0) { pthread_mutex_unlock(&bk->mutex); return reply_ok(); }
 
     uint64_t hh_off = hashheader_new(h, HASH_FIELD_BUCKETS);
     if (hh_off == OFFSET_NULL) {
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+        return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
     }
     uint64_t new_ne = nameentry_alloc(h, key, klen, ENTRY_HASH, hh_off);
     if (new_ne == OFFSET_NULL) {
@@ -186,7 +194,7 @@ s_replyObject *cmd_hcreate(ShmHandle *h, string_t *args[], uint32_t argc)
         pthread_mutex_destroy(&tmp->mutex);
         heap_free(h, hh_off);
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+        return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
     }
     ((NameEntry *)OFF2PTR(h, new_ne))->next_offset = bk->head_offset;
     bk->head_offset = new_ne;
@@ -196,12 +204,12 @@ s_replyObject *cmd_hcreate(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── HDROP ───────────────────────────────────────────────── */
-s_replyObject *cmd_hdrop(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hdrop(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: HDROP key");
     const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
 
-    uint32_t     idx = shm_hash(key, klen);
+    uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk  = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -209,7 +217,7 @@ s_replyObject *cmd_hdrop(ShmHandle *h, string_t *args[], uint32_t argc)
     uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_HASH, &prev);
     if (ne_off == OFFSET_NULL) {
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_NOT_FOUND, shm_strerror(SHM_ERR_NOT_FOUND));
+        return reply_error(SHM_ERR_NOT_FOUND, mredis_strerror(SHM_ERR_NOT_FOUND));
     }
     NameEntry  *ne    = (NameEntry *)OFF2PTR(h, ne_off);
     uint64_t    hh_off = ne->data_offset;
@@ -231,7 +239,7 @@ s_replyObject *cmd_hdrop(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── HSET ────────────────────────────────────────────────── */
-s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hset(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4 || (argc - 2) % 2 != 0)
         return reply_error(SHM_ERR_ARGC,
@@ -242,7 +250,7 @@ s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
 
     /* 타입 충돌 사전 검사 */
     {
-        uint32_t     idx = shm_hash(key, klen);
+        uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
         BucketEntry *bk  = core_get_bucket(h, idx);
         bucket_lock(h, idx);
         uint64_t any = bucket_find_locked(h, bk, key, klen, 0, NULL);
@@ -251,7 +259,7 @@ s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
             if (ne->type != ENTRY_HASH) {
                 pthread_mutex_unlock(&bk->mutex);
                 return reply_error(SHM_ERR_KEY_EXISTS,
-                                   shm_strerror(SHM_ERR_KEY_EXISTS));
+                                   mredis_strerror(SHM_ERR_KEY_EXISTS));
             }
         }
         pthread_mutex_unlock(&bk->mutex);
@@ -259,7 +267,7 @@ s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
 
     int err = SHM_OK;
     HashHeader *hh = hash_get_or_create(h, key, klen, &err);
-    if (!hh) return reply_error(err, shm_strerror(err));
+    if (!hh) return reply_error(err, mredis_strerror(err));
 
     int rc = pthread_mutex_lock(&hh->mutex);
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->mutex);
@@ -279,7 +287,7 @@ s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
             uint64_t nvo = heap_alloc(h, vlen > 0 ? vlen : 1);
             if (nvo == OFFSET_NULL) {
                 pthread_mutex_unlock(&hh->mutex);
-                return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+                return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
             }
             if (vlen > 0) memcpy(OFF2PTR(h, nvo), val, vlen);
             fe->val_offset = nvo; fe->val_len = vlen;
@@ -292,7 +300,7 @@ s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
                 if (voff != OFFSET_NULL) heap_free(h, voff);
                 if (eoff != OFFSET_NULL) heap_free(h, eoff);
                 pthread_mutex_unlock(&hh->mutex);
-                return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+                return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
             }
             memcpy(OFF2PTR(h, foff), field, flen);
             if (vlen > 0) memcpy(OFF2PTR(h, voff), val, vlen);
@@ -302,7 +310,7 @@ s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
             fe->val_offset   = voff; fe->val_len   = vlen;
 
             uint64_t *bkts = hh_field_buckets(hh);
-            uint32_t  bi   = shm_field_hash(field, flen, hh->n_buckets);
+            uint32_t  bi   = mredis_field_hash(field, flen, hh->n_buckets);
             fe->next_offset = bkts[bi];
             bkts[bi]        = eoff;
             hh->field_count++;
@@ -314,7 +322,7 @@ s_replyObject *cmd_hset(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── HGET ────────────────────────────────────────────────── */
-s_replyObject *cmd_hget(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hget(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3) return reply_error(SHM_ERR_ARGC, "usage: HGET key field");
     HashHeader *hh = core_hash_get(h, args[1]->ptr, args[1]->len);
@@ -331,7 +339,7 @@ s_replyObject *cmd_hget(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── HDEL ────────────────────────────────────────────────── */
-s_replyObject *cmd_hdel(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hdel(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3) return reply_error(SHM_ERR_ARGC, "usage: HDEL key field [field …]");
     HashHeader *hh = core_hash_get(h, args[1]->ptr, args[1]->len);
@@ -343,7 +351,7 @@ s_replyObject *cmd_hdel(ShmHandle *h, string_t *args[], uint32_t argc)
     for (uint32_t a = 2; a < argc; a++) {
         const void *field = args[a]->ptr; uint32_t flen = args[a]->len;
         if (flen == 0) continue;
-        uint32_t bi   = shm_field_hash(field, flen, hh->n_buckets);
+        uint32_t bi   = mredis_field_hash(field, flen, hh->n_buckets);
         uint64_t prev = OFFSET_NULL, cur = bkts[bi];
         while (cur != OFFSET_NULL) {
             FieldEntry *fe = (FieldEntry *)OFF2PTR(h, cur);
@@ -366,7 +374,7 @@ s_replyObject *cmd_hdel(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── HEXISTS ─────────────────────────────────────────────── */
-s_replyObject *cmd_hexists(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hexists(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3) return reply_error(SHM_ERR_ARGC, "usage: HEXISTS key field");
     HashHeader *hh = core_hash_get(h, args[1]->ptr, args[1]->len);
@@ -380,7 +388,7 @@ s_replyObject *cmd_hexists(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── HLEN  [FIX-4: mutex 보호 추가] ─────────────────────── */
-s_replyObject *cmd_hlen(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hlen(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: HLEN key");
     HashHeader *hh = core_hash_get(h, args[1]->ptr, args[1]->len);
@@ -393,7 +401,7 @@ s_replyObject *cmd_hlen(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── hash_scan  [FIX-5: cap 조정] ───────────────────────── */
-static s_replyObject *hash_scan(ShmHandle *h, HashHeader *hh, int mode)
+static s_replyObject *hash_scan(MRedisHandle *h, HashHeader *hh, int mode)
 {
     /* mode 0=HGETALL(field+val), 1=HKEYS(field only), 2=HVALS(val only) */
     size_t cap = (mode == 0)
@@ -427,7 +435,7 @@ static s_replyObject *hash_scan(ShmHandle *h, HashHeader *hh, int mode)
 }
 
 /* ── HGETALL / HKEYS / HVALS ─────────────────────────────── */
-s_replyObject *cmd_hgetall(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hgetall(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: HGETALL key");
     HashHeader *hh = core_hash_get(h, args[1]->ptr, args[1]->len);
@@ -436,9 +444,9 @@ s_replyObject *cmd_hgetall(ShmHandle *h, string_t *args[], uint32_t argc)
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->mutex);
     s_replyObject *r = hash_scan(h, hh, 0);
     pthread_mutex_unlock(&hh->mutex);
-    return r ? r : reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+    return r ? r : reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
 }
-s_replyObject *cmd_hkeys(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hkeys(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: HKEYS key");
     HashHeader *hh = core_hash_get(h, args[1]->ptr, args[1]->len);
@@ -447,9 +455,9 @@ s_replyObject *cmd_hkeys(ShmHandle *h, string_t *args[], uint32_t argc)
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->mutex);
     s_replyObject *r = hash_scan(h, hh, 1);
     pthread_mutex_unlock(&hh->mutex);
-    return r ? r : reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+    return r ? r : reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
 }
-s_replyObject *cmd_hvals(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hvals(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: HVALS key");
     HashHeader *hh = core_hash_get(h, args[1]->ptr, args[1]->len);
@@ -458,11 +466,11 @@ s_replyObject *cmd_hvals(ShmHandle *h, string_t *args[], uint32_t argc)
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->mutex);
     s_replyObject *r = hash_scan(h, hh, 2);
     pthread_mutex_unlock(&hh->mutex);
-    return r ? r : reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+    return r ? r : reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
 }
 
 /* ── 숫자 읽기 / 쓰기 (mutex 잠긴 상태) ─────────────────── */
-static int64_t hfield_read_int(ShmHandle *h, HashHeader *hh,
+static int64_t hfield_read_int(MRedisHandle *h, HashHeader *hh,
                                 const void *field, uint32_t flen)
 {
     uint64_t fe_off = field_find_locked(h, hh, field, flen, NULL);
@@ -475,7 +483,7 @@ static int64_t hfield_read_int(ShmHandle *h, HashHeader *hh,
     return (int64_t)strtoll(buf, NULL, 10);
 }
 
-static double hfield_read_float(ShmHandle *h, HashHeader *hh,
+static double hfield_read_float(MRedisHandle *h, HashHeader *hh,
                                  const void *field, uint32_t flen)
 {
     uint64_t fe_off = field_find_locked(h, hh, field, flen, NULL);
@@ -488,7 +496,7 @@ static double hfield_read_float(ShmHandle *h, HashHeader *hh,
     return strtod(buf, NULL);
 }
 
-static int hfield_write_str(ShmHandle *h, HashHeader *hh,
+static int hfield_write_str(MRedisHandle *h, HashHeader *hh,
                               const void *field, uint32_t flen,
                               const char *sval, uint32_t slen)
 {
@@ -519,7 +527,7 @@ static int hfield_write_str(ShmHandle *h, HashHeader *hh,
     fe->field_offset = foff; fe->field_len = flen;
     fe->val_offset   = voff; fe->val_len   = slen;
 
-    uint32_t bi      = shm_field_hash(field, flen, hh->n_buckets);
+    uint32_t bi      = mredis_field_hash(field, flen, hh->n_buckets);
     fe->next_offset  = bkts[bi];
     bkts[bi]         = eoff;
     hh->field_count++;
@@ -527,7 +535,7 @@ static int hfield_write_str(ShmHandle *h, HashHeader *hh,
 }
 
 /* ── HINCRBY ─────────────────────────────────────────────── */
-s_replyObject *cmd_hincrby(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hincrby(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4) return reply_error(SHM_ERR_ARGC, "usage: HINCRBY key field delta");
     char *ep    = NULL;
@@ -536,7 +544,7 @@ s_replyObject *cmd_hincrby(ShmHandle *h, string_t *args[], uint32_t argc)
 
     int err = SHM_OK;
     HashHeader *hh = hash_get_or_create(h, args[1]->ptr, args[1]->len, &err);
-    if (!hh) return reply_error(err, shm_strerror(err));
+    if (!hh) return reply_error(err, mredis_strerror(err));
 
     int rc = pthread_mutex_lock(&hh->mutex);
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->mutex);
@@ -546,12 +554,12 @@ s_replyObject *cmd_hincrby(ShmHandle *h, string_t *args[], uint32_t argc)
     char    sbuf[32]; int slen = snprintf(sbuf, sizeof(sbuf), "%lld", (long long)new_val);
     int     r = hfield_write_str(h, hh, args[2]->ptr, args[2]->len, sbuf, (uint32_t)slen);
     pthread_mutex_unlock(&hh->mutex);
-    if (r != SHM_OK) return reply_error(r, shm_strerror(r));
+    if (r != SHM_OK) return reply_error(r, mredis_strerror(r));
     return reply_integer(new_val);
 }
 
 /* ── HINCRBYFLOAT ────────────────────────────────────────── */
-s_replyObject *cmd_hincrbyfloat(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_hincrbyfloat(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4) return reply_error(SHM_ERR_ARGC, "usage: HINCRBYFLOAT key field delta");
     char *ep    = NULL;
@@ -560,7 +568,7 @@ s_replyObject *cmd_hincrbyfloat(ShmHandle *h, string_t *args[], uint32_t argc)
 
     int err = SHM_OK;
     HashHeader *hh = hash_get_or_create(h, args[1]->ptr, args[1]->len, &err);
-    if (!hh) return reply_error(err, shm_strerror(err));
+    if (!hh) return reply_error(err, mredis_strerror(err));
 
     int rc = pthread_mutex_lock(&hh->mutex);
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->mutex);
@@ -570,6 +578,66 @@ s_replyObject *cmd_hincrbyfloat(ShmHandle *h, string_t *args[], uint32_t argc)
     char   sbuf[64]; int slen = snprintf(sbuf, sizeof(sbuf), "%.17g", new_val);
     int    r = hfield_write_str(h, hh, args[2]->ptr, args[2]->len, sbuf, (uint32_t)slen);
     pthread_mutex_unlock(&hh->mutex);
-    if (r != SHM_OK) return reply_error(r, shm_strerror(r));
+    if (r != SHM_OK) return reply_error(r, mredis_strerror(r));
     return reply_string(sbuf, (size_t)slen);
 }
+
+/* ── ENTRY_HASH drop ────────────────────────────────────────
+ *  ① bucket lock → NameEntry 제거 → bucket unlock
+ *  ② HashHeader.mutex lock → 모든 FieldEntry 해제 → unlock
+ *  ③ HashHeader 힙 해제
+ *  (cmd_hdrop 과 동일한 순서)
+ * ─────────────────────────────────────────────────────────── */
+
+/* hash_drop_fields_locked 는 cmd_hash.c 내부 static 이므로
+ * 동일 로직을 여기서 인라인으로 수행한다.              */
+static void drop_hash_fields(MRedisHandle *h, HashHeader *hh)
+{
+    uint64_t *bkts = hh_field_buckets(hh);
+    for (uint32_t i = 0; i < hh->n_buckets; i++) {
+        uint64_t cur = bkts[i];
+        while (cur != OFFSET_NULL) {
+            FieldEntry *fe = (FieldEntry *)OFF2PTR(h, cur);
+            uint64_t    nxt = fe->next_offset;
+            heap_free(h, fe->field_offset);
+            heap_free(h, fe->val_offset);
+            heap_free(h, cur);
+            cur = nxt;
+        }
+        bkts[i] = OFFSET_NULL;
+    }
+    hh->field_count = 0;
+}
+
+int drop_hash(MRedisHandle *h, const void *key, uint32_t klen)
+{
+    uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
+    BucketEntry *bk  = core_get_bucket(h, idx);
+    bucket_lock(h, idx);
+
+    uint64_t prev   = OFFSET_NULL;
+    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_HASH, &prev);
+    if (ne_off == OFFSET_NULL) {
+        pthread_mutex_unlock(&bk->mutex);
+        return SHM_ERR_NOT_FOUND;
+    }
+    NameEntry  *ne    = (NameEntry  *)OFF2PTR(h, ne_off);
+    uint64_t    hh_off = ne->data_offset;
+    HashHeader *hh     = (HashHeader *)OFF2PTR(h, hh_off);
+
+    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
+    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
+    nameentry_free(h, ne_off);
+    pthread_mutex_unlock(&bk->mutex);   /* bucket unlock 먼저 */
+
+    int rc = pthread_mutex_lock(&hh->mutex);
+    if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->mutex);
+    drop_hash_fields(h, hh);
+    pthread_mutex_unlock(&hh->mutex);
+    pthread_mutex_destroy(&hh->mutex);
+    heap_free(h, hh_off);
+
+    LOG_TRACE("DEL(HASH): '%.*s'", klen, (const char *)key);
+    return SHM_OK;
+}
+

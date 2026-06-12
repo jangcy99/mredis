@@ -16,11 +16,11 @@
  *    Hash : HCREATE HDROP HSET HGET HDEL HEXISTS HLEN
  *           HGETALL HKEYS HVALS HINCRBY HINCRBYFLOAT
  */
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 
 /* 커맨드 함수 포인터 타입 */
-typedef s_replyObject *(*CmdFunc)(ShmHandle *h,
+typedef s_replyObject *(*CmdFunc)(MRedisHandle *h,
                                   string_t  *args[],
                                   uint32_t   argc);
 
@@ -41,7 +41,7 @@ typedef struct	{
  *   args[0] 의 커맨드 이름을 찾아 해당 함수를 호출한다.
  *   알 수 없는 커맨드이면 REPLY_ERROR 반환.
  */
-s_replyObject *cmd_dispatch(ShmHandle *h,
+s_replyObject *cmd_dispatch(MRedisHandle *h,
                              string_t  *args[],
                              uint32_t   argc);
 

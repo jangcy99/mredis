@@ -3,7 +3,7 @@
  *
  *  설계 원칙
  *  ──────────────────────────────────────────────────────────────────
- *  1. 기존 파일 무수정. shm_types.h / shm_core.h 공개 API 만 사용.
+ *  1. 기존 파일 무수정. mredis_types.h / mredis_core.h 공개 API 만 사용.
  *  2. tmp 파일에 쓰고 완료 후 rename → 저장 중 크래시로 파일 손상 없음.
  *  3. 파일 끝에 CRC-32 → 적재 시 무결성 자동 검증.
  *  4. BGSAVE: fork() → 자식이 SHM CoW 스냅샷 저장.
@@ -42,8 +42,8 @@
 #include <sys/stat.h>
 #include <pthread.h>
 
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_dispatch.h"
 #include "rdb.h"
 
@@ -170,9 +170,9 @@ static char *rr_str(RdbReader *r, uint32_t *out_len)
 /* ============================================================
  *  §4  버킷 카운트 1회 순회 (key_count 확정용)
  * ============================================================ */
-static uint64_t count_keys(ShmHandle *shm)
+static uint64_t count_keys(MRedisHandle *shm)
 {
-    ShmHeader *shdr = core_shm_hdr(shm);
+    MRedisHeader *shdr = core_mredis_hdr(shm);
     uint64_t   cnt  = 0;
     for (uint32_t i=0; i<shdr->hash_table_size; i++) {
         BucketEntry *bk = core_get_bucket(shm, i);
@@ -192,7 +192,7 @@ static uint64_t count_keys(ShmHandle *shm)
 /* ============================================================
  *  §5  레코드 직렬화
  * ============================================================ */
-static void save_kv(ShmHandle *h, RdbWriter *w,
+static void save_kv(MRedisHandle *h, RdbWriter *w,
                     const char *key, uint32_t klen, NameEntry *ne)
 {
     KVNode *kv = (KVNode*)OFF2PTR(h, ne->data_offset);
@@ -204,7 +204,7 @@ static void save_kv(ShmHandle *h, RdbWriter *w,
         RW_STR(w,"",0);
 }
 
-static void save_zset(ShmHandle *h, RdbWriter *w,
+static void save_zset(MRedisHandle *h, RdbWriter *w,
                       const char *key, uint32_t klen, NameEntry *ne)
 {
     ZSetHeader *zsh = (ZSetHeader*)OFF2PTR(h, ne->data_offset);
@@ -220,7 +220,7 @@ static void save_zset(ShmHandle *h, RdbWriter *w,
     }
 }
 
-static void save_hash(ShmHandle *h, RdbWriter *w,
+static void save_hash(MRedisHandle *h, RdbWriter *w,
                       const char *key, uint32_t klen, NameEntry *ne)
 {
     HashHeader *hh   = (HashHeader*)OFF2PTR(h, ne->data_offset);
@@ -246,7 +246,7 @@ static void save_hash(ShmHandle *h, RdbWriter *w,
 
 #include "cmd_bset.h"
 /* BSET 저장 */
-static void save_bset(ShmHandle *h, RdbWriter *w,
+static void save_bset(MRedisHandle *h, RdbWriter *w,
                       const char *key, uint32_t klen, NameEntry *ne)
 {
     BSetHeader *bsh = (BSetHeader*)OFF2PTR(h, ne->data_offset);
@@ -269,7 +269,7 @@ static void save_bset(ShmHandle *h, RdbWriter *w,
 }
 
 /* BSET 복구 */
-static int load_bset(RdbReader *r, ShmHandle *h,
+static int load_bset(RdbReader *r, MRedisHandle *h,
                      const char *key, uint32_t klen)
 {
     uint64_t count = rr_u64(r);
@@ -316,7 +316,7 @@ static int load_bset(RdbReader *r, ShmHandle *h,
  *    (5) CRC 기록 (CRC 범위 밖)
  *    (6) fdatasync + atomic rename
  * ============================================================ */
-int rdb_save(RdbHandle *rdb, ShmHandle *shm)
+int rdb_save(RdbHandle *rdb, MRedisHandle *shm)
 {
     if (!rdb || !shm) return SHM_ERR;
 
@@ -346,7 +346,7 @@ int rdb_save(RdbHandle *rdb, ShmHandle *shm)
     rw_raw(&w, &fhdr, sizeof(fhdr));   /* CRC 에 완전한 헤더 포함 */
 
     /* (3) 레코드 직렬화 */
-    ShmHeader *shdr = core_shm_hdr(shm);
+    MRedisHeader *shdr = core_mredis_hdr(shm);
     for (uint32_t i=0; i<shdr->hash_table_size; i++) {
         BucketEntry *bk = core_get_bucket(shm,i);
         if (pthread_mutex_trylock(&bk->mutex) != 0) continue;
@@ -410,7 +410,7 @@ int rdb_save(RdbHandle *rdb, ShmHandle *shm)
 /* ============================================================
  *  §7  레코드 역직렬화 (Reader → SHM)
  * ============================================================ */
-static int load_kv(RdbReader *r, ShmHandle *shm,
+static int load_kv(RdbReader *r, MRedisHandle *shm,
                    const char *key, uint32_t klen)
 {
     uint32_t vlen; char *val=rr_str(r,&vlen);
@@ -423,7 +423,7 @@ static int load_kv(RdbReader *r, ShmHandle *shm,
     return r->err?-1:0;
 }
 
-static int load_zset(RdbReader *r, ShmHandle *shm,
+static int load_zset(RdbReader *r, MRedisHandle *shm,
                      const char *key, uint32_t klen)
 {
     uint64_t cnt=rr_u64(r);
@@ -451,7 +451,7 @@ static int load_zset(RdbReader *r, ShmHandle *shm,
     return r->err?-1:0;
 }
 
-static int load_hash(RdbReader *r, ShmHandle *shm,
+static int load_hash(RdbReader *r, MRedisHandle *shm,
                      const char *key, uint32_t klen)
 {
     uint64_t cnt=rr_u64(r);
@@ -481,7 +481,7 @@ static int load_hash(RdbReader *r, ShmHandle *shm,
 /* ============================================================
  *  §8  rdb_load
  * ============================================================ */
-int64_t rdb_load(RdbHandle *rdb, ShmHandle *shm)
+int64_t rdb_load(RdbHandle *rdb, MRedisHandle *shm)
 {
     if (!rdb||!shm) return -1;
 
@@ -569,7 +569,7 @@ int64_t rdb_load(RdbHandle *rdb, ShmHandle *shm)
 /* ============================================================
  *  §9  BGSAVE
  * ============================================================ */
-int rdb_save_bg(RdbHandle *rdb, ShmHandle *shm)
+int rdb_save_bg(RdbHandle *rdb, MRedisHandle *shm)
 {
     if (!rdb||!shm) return SHM_ERR;
     if (rdb->saving) {

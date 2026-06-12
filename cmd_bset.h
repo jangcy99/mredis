@@ -45,8 +45,8 @@
  * └─────────────────────────────────────────────────────────────────────┘
  */
 
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 
 /* ── ENTRY 타입 번호 ─────────────────────────────────────── */
 #ifndef ENTRY_BSET
@@ -81,19 +81,20 @@ typedef struct {
 } BSetHeader;
 
 /* ── 공개 API ─────────────────────────────────────────────── */
-s_replyObject *cmd_bset         (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_bget         (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_bdel         (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_brange       (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_brangebyscore(ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_bcard        (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_brank        (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_bcount       (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_bpopmin      (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_bpopmax      (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_bdrop        (ShmHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_bset         (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_bget         (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_bdel         (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_brange       (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_brangebyscore(MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_bcard        (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_brank        (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_bcount       (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_bpopmin      (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_bpopmax      (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_bdrop        (MRedisHandle *h, string_t *args[], uint32_t argc);
 
 /* 내부 조회 (단위테스트 / cmd_del 라우팅용) */
-BSetHeader *core_bset_get(ShmHandle *h, const void *key, uint32_t klen);
+BSetHeader *core_bset_get(MRedisHandle *h, const void *key, uint32_t klen);
 
+int drop_bset(MRedisHandle *h, const void *key, uint32_t klen);
 #endif /* CMD_BSET_H */

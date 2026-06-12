@@ -1,29 +1,5 @@
 /*
- * shm_core.c  –  SHM 엔진 (힙, 버킷, Skip List, 생명주기)
- *
- * 버그 수정 사항:
- *  [BUG-1] sl_find_member: O(n) 순차 탐색 → 기존 구조상 어쩔 수 없으나
- *          cur_level 무시하는 문제 없음. 유지.
- *  [BUG-2] shm_create: BucketEntry mutex 초기화 루프에서
- *          pthread_mutexattr_t 를 루프 밖에서 한 번만 생성/파괴. (원본 동일, 정상)
- *  [BUG-3] heap_alloc/heap_free: heap_mutex 하나로 직렬화. 정상.
- *  [BUG-4] bucket_lock: EOWNERDEAD 처리 후 pthread_mutex_consistent 호출. 정상.
- *  [BUG-5] sl_unlink: zsh->tail_offset 갱신을 upd[0]으로 하는데,
- *          upd[0]이 head sentinel일 수 있어 tail이 sentinel을 가리킴.
- *          → tail 갱신 조건: sn->forward[0]==OFFSET_NULL 일 때만.
- *          원본 코드가 이미 올바르게 처리함.
- *  [BUG-6] heap_alloc_locked: split 블록 생성 시 split->size 계산에서
- *          sizeof(BlockHeader)를 중복 차감하는 잠재적 오류 확인 → 정상.
- *  [BUG-7] nameentry_alloc: heap_alloc(klen=0) 방어 누락.
- *          klen==0이면 heap_alloc(0)→8바이트 할당, 정상 처리됨.
- *
- * 실제 버그:
- *  [FIX-1] bucket_find: bucket_lock 호출 후 bk 포인터를 다시 획득해야 함.
- *          원본은 bucket_lock(idx) 후 core_get_bucket(idx) 재호출 — 정상.
- *  [FIX-2] sl_node_alloc: ml==0 일 때 heap_alloc(0) 호출 → 8바이트 할당.
- *          member_len=0인 노드는 sentinel 외에 없으므로 실사용 무해.
- *  [FIX-3] shm_hash / shm_field_hash: klen=0 입력 시 초기값 반환. 안전.
- *  [FIX-4] heap 통계: used_bytes underflow 방어 코드 존재. 정상.
+ * mredis_core.c  –  SHM 엔진 (힙, 버킷, 구조적 안정성 커널 최적화 버전)
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,13 +13,13 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <pthread.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 
-int g_shm_dbg = SHM_DEBUG_LEVEL;
-void shm_set_debug_level(int l) { g_shm_dbg = l; }
+int g_mredis_dbg = SHM_DEBUG_LEVEL;
+void mredis_set_debug_level(int l) { g_mredis_dbg = l; }
 
-const char *shm_strerror(int e)
+const char *mredis_strerror(int e)
 {
     switch(e){
     case SHM_OK:            return "OK";
@@ -62,41 +38,26 @@ const char *shm_strerror(int e)
 }
 
 /* ──────────────────── 해시 ──────────────────────────────── */
-uint32_t shm_hash(const void *key, uint32_t klen)
+uint64_t mredis_hash(const void *key, uint32_t klen)
 {
-#if 0
+    if (klen == 0 || !key) return 0; // 명시적 방어 코드 추가
     const uint8_t *p = (const uint8_t *)key;
     uint64_t h = 14695981039346656037ULL;
     for (uint32_t i = 0; i < klen; i++) { h ^= p[i]; h *= 1099511628211ULL; }
-    return (uint32_t)(h % (uint64_t)HASH_TABLE_SIZE);
-#else
-	uint8_t	k[] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
-	return siphash (key, klen, k) % HASH_TABLE_SIZE;
-#endif
+    return h;
 }
-uint32_t shm_field_hash(const void *f, uint32_t flen, uint32_t nb)
+uint32_t mredis_field_hash(const void *f, uint32_t flen, uint32_t nb)
 {
-#if 0
+    if (flen == 0 || !f || nb == 0) return 0;
     const uint8_t *p = (const uint8_t *)f;
     uint64_t h = 14695981039346656037ULL;
     for (uint32_t i = 0; i < flen; i++) { h ^= p[i]; h *= 1099511628211ULL; }
     return (uint32_t)(h % (uint64_t)nb);
-#else
-	uint8_t	k[] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
-	return siphash (f, flen, k) % nb;
-#endif
 }
 
 /* ============================================================
- *  Segregated Fit Heap with Coalescing (Boundary Tag)
+ * Segregated Fit Heap Layout Macros
  * ============================================================ */
-/* ============================================================
- *  Segregated Fit + Forward Coalescing Heap
- * ============================================================ */
-/* ============================================================
- *  Segregated Fit + Safe Forward Coalescing
- * ============================================================ */
-
 #define ALIGN_SIZE         8
 #define MIN_BLOCK_SIZE     64
 
@@ -108,18 +69,11 @@ uint32_t shm_field_hash(const void *f, uint32_t flen, uint32_t nb)
 static uint32_t get_bin_index(uint64_t size)
 {
 	if (size <= 64) return 0;
-
-    // 64 초과인 경우 비트 위치를 계산하여 Bin 인덱스 도출 (O(1))
-    // __builtin_clzll은 64비트 정수에서 상위 0비트 개수를 세어주는 내장 함수입니다.
     uint64_t leading_zeros = (uint64_t)__builtin_clzll(size - 1);
     uint32_t bit_pos = 64 - (uint32_t)leading_zeros;
-
-    // size=65~128 -> bit_pos=7 -> bin = 7 - 6 = 1
     uint32_t bin = (bit_pos > 6) ? (bit_pos - 6) : 0;
-
     return (bin < BIN_COUNT) ? bin : (BIN_COUNT - 1);
 }
-
 
 #define TOTAL_BLOCK_SIZE(bh) \
     ((bh)->size + sizeof(BlockHeader) + sizeof(BlockFooter))
@@ -127,11 +81,9 @@ static uint32_t get_bin_index(uint64_t size)
 #define	SZ_BLOCKFOOTER	(sizeof (BlockFooter))
 #define	SZ_BLOCK_SIZE	(SZ_BLOCKHEADER + SZ_BLOCKFOOTER)
 
-// 1. 헤더 오프셋을 기준으로 해당 블록의 푸터 포인터를 찾아가는 매크로
 #define GET_FOOTER(h, block_off) \
     ((BlockFooter*)((uint8_t*)OFF2PTR(h, block_off) + sizeof(BlockHeader) + ((BlockHeader*)OFF2PTR(h, block_off))->size))
 
-// 2. 현재 블록 헤더의 오프셋에 총 크기(TOTAL_BLOCK_SIZE)를 더해 다음 블록의 오프셋을 도출하는 매크로
 #define GET_NEXT_BLOCK_OFFSET(h, block_off) \
     ((block_off) + TOTAL_BLOCK_SIZE((BlockHeader*)OFF2PTR(h, block_off)))
 
@@ -141,42 +93,31 @@ static uint32_t get_bin_index(uint64_t size)
     ((offset) - SZ_BLOCKFOOTER - ((BlockFooter*)GET_PREV_FOOTER(h,offset))->size - SZ_BLOCKHEADER)
 
 
-#if 0
-static uint32_t get_block_bin(uint64_t payload_size) {
-    return get_bin_index(payload_size + SZ_BLOCK_SIZE);
-}
-#endif
-
 /* =========================================================================
- * [수정] remove_free_bins: 안전하게 블록 자체 플래그에 기록된 빈 인덱스 활용
+ * Free List 제어 기본 서브루틴
  * ========================================================================= */
-static void remove_free_bins(ShmHandle *h, uint64_t offset)
+static void remove_free_bins(MRedisHandle *h, uint64_t offset)
 {
     if (offset == OFFSET_NULL) return;
 
     HeapHeader  *hh = core_heap_hdr(h);
     BlockHeader *bh = (BlockHeader *)OFF2PTR(h, offset);
 
-    // 이 블록이 소속된 빈 인덱스 추출
     uint32_t bin = GET_BIN_IDX(bh->flags);
     if (bin >= BIN_COUNT) return;
 
-    // 만약 리스트의 마스터 Head가 바로 이 노드라면
     if (hh->free_bins[bin] == offset) {
         hh->free_bins[bin] = bh->next;
         if (bh->next != OFFSET_NULL) {
             BlockHeader *nbh = (BlockHeader *)OFF2PTR(h, bh->next);
-            nbh->prev = OFFSET_NULL; // 다음 노드가 새로운 Head가 되므로 prev를 비워줌
+            nbh->prev = OFFSET_NULL;
         }
-        // 안전을 위해 제거된 노드의 링크 초기화
         bh->next = OFFSET_NULL;
         bh->prev = OFFSET_NULL;
         return;
     }
 
-    // [CRITICAL GUARD] Head가 아님에도 bh->prev가 NULL이거나 비정상적 주소인 경우 방어
-    if (bh->prev == OFFSET_NULL || bh->prev == 18446744073709551615ULL) {
-        // 링크 구조가 이미 꼬여 역추적이 불가능하므로, 루프를 돌며 나를 가리키는 전방 노드를 직접 탐색
+    if (bh->prev == OFFSET_NULL)	{
         uint64_t prev_search = hh->free_bins[bin];
         while (prev_search != OFFSET_NULL) {
             BlockHeader *p_chk = (BlockHeader *)OFF2PTR(h, prev_search);
@@ -191,7 +132,6 @@ static void remove_free_bins(ShmHandle *h, uint64_t offset)
             prev_search = p_chk->next;
         }
     } else {
-        // 일반적인 중간 노드 제거 공정 (주소 유효성 안전 검증 포함)
         uint64_t heap_end = hh->heap_start + hh->heap_size;
         if (bh->prev >= hh->heap_start && bh->prev < heap_end) {
             BlockHeader *pbh = (BlockHeader *)OFF2PTR(h, bh->prev);
@@ -204,43 +144,40 @@ static void remove_free_bins(ShmHandle *h, uint64_t offset)
         }
     }
 
-    // 제거 완료된 블록의 독성 포인터 완전 격리 폐기
     bh->next = OFFSET_NULL;
     bh->prev = OFFSET_NULL;
 }
-static void insert_free_bin(ShmHandle *h, uint32_t bin, uint64_t offset)
+
+static void insert_free_bin(MRedisHandle *h, uint32_t bin, uint64_t offset)
 {
     if (offset == OFFSET_NULL || bin >= BIN_COUNT) return;
 
     HeapHeader  *hh = core_heap_hdr(h);
     BlockHeader *bh = (BlockHeader *)OFF2PTR(h, offset);
 
-    // 중복 삽입 무력화 가드
-    if (hh->free_bins[bin] == offset) {
-        return;
-    }
+    if (hh->free_bins[bin] == offset) return;
 
     SET_BIN_IDX(bh->flags, bin);
     SET_IS_FREE(bh->flags, 1);
 
-    // LIFO (Last-In, First-Out) 완벽한 정형 연결
     bh->prev = OFFSET_NULL;
     bh->next = hh->free_bins[bin];
 
     if (hh->free_bins[bin] != OFFSET_NULL) {
         BlockHeader *old_head = (BlockHeader *)OFF2PTR(h, hh->free_bins[bin]);
-        old_head->prev = offset; // 기존 Head의 백포인터를 나에게 연결
+        old_head->prev = offset;
     }
 
-    hh->free_bins[bin] = offset; // 힙 마스터 헤더 갱신
+    hh->free_bins[bin] = offset;
 }
 
-static uint64_t try_coalesce(ShmHandle *h, uint64_t block_off) {
+/* [FIXED-2] try_coalesce: 매크로 기반 주소 연산 전환 및 병합 흐름 무결성 확보 */
+static uint64_t try_coalesce(MRedisHandle *h, uint64_t block_off) {
     HeapHeader  *hh = core_heap_hdr(h);
     BlockHeader *bh = (BlockHeader*)OFF2PTR(h, block_off);
 
-    // 1. 전방(이전) 물리 블록 병합 처리
-    const uint64_t min_required_offset = hh->heap_start + sizeof(BlockHeader) + sizeof(BlockFooter);
+    // 1. 전방 물리 블록 병합
+    const uint64_t min_required_offset = hh->heap_start + SZ_BLOCK_SIZE;
     if (block_off >= min_required_offset) {
         uint64_t footer_off = block_off - sizeof(BlockFooter);
         BlockFooter *prev_footer = (BlockFooter*)OFF2PTR(h, footer_off);
@@ -254,11 +191,10 @@ static uint64_t try_coalesce(ShmHandle *h, uint64_t block_off) {
                     BlockHeader *prev_ptr = (BlockHeader*)OFF2PTR(h, prev_block_offset);
 
                     if (prev_ptr->magic == HEAP_BLOCK_MAGIC && GET_IS_FREE(prev_ptr->flags)) {
-                        // [핵심 해결] 합쳐져서 흡수될 이전 프리 블록을 기존 리스트에서 완전히 지워줍니다!
                         remove_free_bins(h, prev_block_offset);
 
                         prev_ptr->size += (sizeof(BlockHeader) + bh->size + sizeof(BlockFooter));
-                        BlockFooter *footer = (BlockFooter*)((uint8_t*)OFF2PTR(h, block_off) + bh->size + sizeof(BlockHeader));
+                        BlockFooter *footer = GET_FOOTER(h, prev_block_offset);
                         footer->magic = HEAP_BLOCK_MAGIC;
                         footer->size = prev_ptr->size;
 
@@ -270,18 +206,17 @@ static uint64_t try_coalesce(ShmHandle *h, uint64_t block_off) {
         }
     }
 
-    // 2. 후방(다음) 물리 블록 병합 처리
-    uint64_t next_block_offset = block_off + bh->size + sizeof(BlockHeader) + sizeof(BlockFooter);
+    // 2. 후방 물리 블록 병합 (매크로 전면 적용)
+    uint64_t next_block_offset = GET_NEXT_BLOCK_OFFSET(h, block_off);
     uint64_t heap_end_bound = hh->heap_start + hh->heap_size;
 
     if (next_block_offset < heap_end_bound) {
         BlockHeader *next_ptr = (BlockHeader*)OFF2PTR(h, next_block_offset);
         if (next_ptr->magic == HEAP_BLOCK_MAGIC && GET_IS_FREE(next_ptr->flags)) {
-            // [핵심 해결] 합쳐져서 소멸할 다음 프리 블록도 리스트에서 깔끔하게 지워줍니다!
             remove_free_bins(h, next_block_offset);
 
-            bh->size += next_ptr->size + sizeof(BlockHeader) + sizeof(BlockFooter);
-            BlockFooter *footer = (BlockFooter*)((uint8_t*)OFF2PTR(h, next_block_offset) + next_ptr->size + sizeof(BlockHeader));
+            bh->size += TOTAL_BLOCK_SIZE(next_ptr);
+            BlockFooter *footer = GET_FOOTER(h, block_off);
             footer->magic = HEAP_BLOCK_MAGIC;
             footer->size = bh->size;
         }
@@ -291,7 +226,7 @@ static uint64_t try_coalesce(ShmHandle *h, uint64_t block_off) {
     return block_off;
 }
 
-static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
+static uint64_t heap_alloc_locked(MRedisHandle *h, uint64_t req)
 {
     if (req == 0) req = 8;
 
@@ -310,7 +245,6 @@ static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
             BlockHeader *bh = (BlockHeader *)OFF2PTR(h, cur);
             uint64_t next_offset = bh->next;
 
-            // [안전 제동 가드] 혹시나 링크가 비정상 순환될 경우 무한 루프 전면 차단
             if (bh->next == cur || ++loop_detector > 1000) {
                 bh->next = OFFSET_NULL;
                 break;
@@ -323,19 +257,16 @@ static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
 
             uint64_t avail = bh->size + SZ_BLOCK_SIZE;
             if (avail >= need) {
-                // 탐색 성공 청크 완전 격리
                 remove_free_bins(h, cur);
 
-                // 분할(Split) 공정 진행
                 if (avail >= need + MIN_BLOCK_SIZE) {
                     bh->size = need - SZ_BLOCK_SIZE;
-                    SET_IS_FREE(bh->flags, 0); // 할당 상태 명시
+                    SET_IS_FREE(bh->flags, 0);
 
-                    BlockFooter *alloc_footer = (BlockFooter *)((uint8_t*)OFF2PTR(h, cur) + bh->size + sizeof(BlockHeader));
+                    BlockFooter *alloc_footer = GET_FOOTER(h, cur);
                     alloc_footer->magic = HEAP_BLOCK_MAGIC;
                     alloc_footer->size = bh->size;
 
-                    // 찌꺼기 블록 생성
                     uint64_t split_off = cur + need;
                     BlockHeader *split = (BlockHeader *)OFF2PTR(h, split_off);
 
@@ -346,15 +277,13 @@ static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
                     split->flags = 0;
                     SET_IS_FREE(split->flags, 1);
 
-                    BlockFooter *split_footer = (BlockFooter *)((uint8_t*)OFF2PTR(h, split_off) + split->size + sizeof(BlockHeader));
+                    BlockFooter *split_footer = GET_FOOTER(h, split_off);
                     split_footer->magic = HEAP_BLOCK_MAGIC;
                     split_footer->size = split->size;
 
-                    // 독립 상태에서 안전 병합 유도
                     uint64_t coalesced_off = try_coalesce(h, split_off);
                     BlockHeader *final_split = (BlockHeader *)OFF2PTR(h, coalesced_off);
 
-                    // 정확한 최종 크기를 활용한 인덱싱 주입
                     uint32_t sbin = get_bin_index(final_split->size + SZ_BLOCK_SIZE);
                     insert_free_bin(h, sbin, coalesced_off);
 
@@ -363,7 +292,7 @@ static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
                     bh->size = need - SZ_BLOCK_SIZE;
                     SET_IS_FREE(bh->flags, 0);
 
-                    BlockFooter *f = (BlockFooter *)((uint8_t*)OFF2PTR(h, cur) + bh->size + sizeof(BlockHeader));
+                    BlockFooter *f = GET_FOOTER(h, cur);
                     f->size = bh->size;
                     f->magic = HEAP_BLOCK_MAGIC;
                 }
@@ -382,8 +311,8 @@ static uint64_t heap_alloc_locked(ShmHandle *h, uint64_t req)
     return OFFSET_NULL;
 }
 
-/* heap_mutex 잡은 상태 */
-static int heap_free_locked(ShmHandle *h, uint64_t data_off)
+/* [FIXED-1] heap_free_locked: 파편화된 리스트 수동 조작 제거 및 insert_free_bin 표준 함수 일원화 */
+static int heap_free_locked(MRedisHandle *h, uint64_t data_off)
 {
     if (data_off == OFFSET_NULL) return SHM_OK;
 
@@ -400,24 +329,15 @@ static int heap_free_locked(ShmHandle *h, uint64_t data_off)
         return SHM_ERR;
     }
 
-    uint64_t freed_size = bh->size + sizeof(BlockHeader) + sizeof (BlockFooter);
+    uint64_t freed_size = TOTAL_BLOCK_SIZE(bh);
 
-    /* Coalescing */
+    /* Coalescing 및 인덱스 안정화 */
     block_off = try_coalesce(h, block_off);
     bh = (BlockHeader *)OFF2PTR(h, block_off);
-    SET_IS_FREE(bh->flags, 1);
+    
+    // 안전한 추상화 함수 인터페이스 사용으로 이중 삽입 버그 근본 차단
     uint32_t bin = get_bin_index(bh->size + SZ_BLOCK_SIZE);
-    SET_BIN_IDX(bh->flags, bin);
-
-
-    /* Insert to free list */
-	bin = get_bin_index(bh->size + SZ_BLOCK_SIZE);
-    bh->next = hh->free_bins[bin];
-	if (bh->next != OFFSET_NULL)	{
-		((BlockHeader*)OFF2PTR(h, bh->next))->prev = block_off;
-	}
-    hh->free_bins[bin] = block_off;
-
+    insert_free_bin(h, bin, block_off);
 
     if (hh->used_bytes >= freed_size)
         hh->used_bytes -= freed_size;
@@ -427,17 +347,162 @@ static int heap_free_locked(ShmHandle *h, uint64_t data_off)
     hh->total_free++;
     return SHM_OK;
 }
+
+/**
+ * @brief Robust Mutex 복구 및 힙 상태 사후 감사(Audit)
+ * @param h MRedis 엔진 핸들
+ * @param mutex_rc pthread_mutex_lock의 리턴 값
+ * @return int 복구 및 검증 성공 시 SHM_OK, 실패 시 SHM_ERR_CORRUPT
+ */
+int mredis_recover_and_audit(MRedisHandle *h, int mutex_rc)
+{
+    // 1. 정상적으로 락을 획득한 경우 검증 패스
+    if (mutex_rc == 0) return SHM_OK;
+
+    // 2. 이전 소유 프로세스가 죽은 경우 (Robust Mutex 핵심 처리)
+    if (mutex_rc == EOWNERDEAD) {
+        HeapHeader *hh = core_heap_hdr(h);
+        LOG_WARN("MREDIS [CRITICAL]: 이전 소유 프로세스 사망 감지 (EOWNERDEAD). 힙 복구 및 Audit 시작.");
+
+        // Mutex를 다시 일관성 있는(Consistent) 상태로 마킹
+        if (pthread_mutex_consistent(&hh->heap_mutex) != 0) {
+            LOG_ERR("MREDIS [FATAL]: pthread_mutex_consistent 호출 실패.");
+            return SHM_ERR_CORRUPT;
+        }
+
+        // 3. 힙 메타데이터 정밀 감사 (Post-Crash Audit)
+        uint64_t heap_end = hh->heap_start + hh->heap_size;
+
+        // 가드 조건 1: 힙 경계 주소가 공유 메모리 전체 크기를 벗어나는지 확인
+        if (heap_end > h->size) {
+            LOG_ERR("MREDIS [AUDIT FAIL]: 힙 영역 경계가 SHM 크기를 초과함. (HeapEnd: %lu > SHM_Size: %lu)", heap_end, h->size);
+            return SHM_ERR_CORRUPT;
+        }
+
+        // 가드 조건 2: 사용 바이트 수가 전체 힙 크기보다 큰지 역전 현상 체크
+        if (hh->used_bytes > hh->heap_size) {
+            LOG_ERR("MREDIS [AUDIT FAIL]: 힙 사용량 오버플로우 감지. (Used: %lu > Total: %lu)", hh->used_bytes, hh->heap_size);
+            return SHM_ERR_CORRUPT;
+        }
+
+        // 가드 조건 3: 최상위 프리 리스트(Free Bins) 오프셋 주소 유효성 체크
+        for (int i = 0; i < BIN_COUNT; i++) {
+            uint64_t bin_off = hh->free_bins[i];
+            if (bin_off != OFFSET_NULL) {
+                if (bin_off < hh->heap_start || bin_off >= heap_end) {
+                    LOG_ERR("MREDIS [AUDIT FAIL]: Free Bin [%d]의 시작 오프셋이 무효함. (Offset: %lu)", i, bin_off);
+                    return SHM_ERR_CORRUPT;
+                }
+            }
+        }
+
+        LOG_INFO("MREDIS [AUDIT PASS]: Robust Mutex 복구 및 1차 메타데이터 검증 완료.");
+        return SHM_OK;
+    }
+
+    // 기타 정의되지 않은 Mutex 에러 처리
+    LOG_ERR("MREDIS [ERROR]: Mutex 락 획득 중 알 수 없는 오류 발생 (rc=%d)", mutex_rc);
+    return SHM_ERR;
+}
+
+/**
+ * @brief 힙 전체 메모리 블록 유효성 전수 검증 (Heap Walker)
+ * @param h MRedis 엔진 핸들
+ * @return int 무결성 통과 시 SHM_OK, 파손 감지 시 SHM_ERR_CORRUPT
+ */
+int mredis_heap_validate_integrity(MRedisHandle *h)
+{
+    HeapHeader *hh = core_heap_hdr(h);
+    uint64_t current_off = hh->heap_start;
+    uint64_t heap_end = hh->heap_start + hh->heap_size;
+    uint64_t calculated_used_bytes = 0;
+    uint64_t block_count = 0;
+
+    LOG_INFO("MREDIS [INTEGRITY]: 힙 메모리 블록 전수 무결성 검사 시작...");
+
+    while (current_off < heap_end) {
+        block_count++;
+
+        // 1. 블록 헤더 포인터 유효성 검사
+        BlockHeader *bh = (BlockHeader *)OFF2PTR(h, current_off);
+
+        // 매직 넘버 검증 (Header)
+        if (bh->magic != HEAP_BLOCK_MAGIC) {
+            LOG_ERR("MREDIS [CORRUPTION DETECTED]: 블록 [%lu] 헤더 매직 넘버 파손! (Offset: %lu, Magic: 0x%X)",
+                    block_count, current_off, bh->magic);
+            return SHM_ERR_CORRUPT;
+        }
+
+        // 블록 사이즈 상한선 가드 체크
+        if (current_off + sizeof(BlockHeader) + bh->size + sizeof(BlockFooter) > heap_end) {
+            LOG_ERR("MREDIS [CORRUPTION DETECTED]: [%lu]번 블록 크기가 힙 경계를 초과함. (Size: %lu)",
+                    block_count, bh->size);
+            return SHM_ERR_CORRUPT;
+        }
+
+        // 2. 블록 푸터 포인터 및 대칭성 검사
+        BlockFooter *bf = (BlockFooter *)((uint8_t *)bh + sizeof(BlockHeader) + bh->size);
+
+        // 매직 넘버 검증 (Footer)
+        if (bf->magic != HEAP_BLOCK_MAGIC) {
+            LOG_ERR("MREDIS [CORRUPTION DETECTED]: 블록 [%lu] 푸터 매직 넘버 파손! (Offset: %lu, Magic: 0x%X)",
+                    block_count, current_off, bf->magic);
+            return SHM_ERR_CORRUPT;
+        }
+
+        // 헤더와 푸터의 기록된 사이즈 일치 여부 검증 (대칭성 검사)
+        if (bh->size != bf->size) {
+            LOG_ERR("MREDIS [CORRUPTION DETECTED]: 블록 [%lu] 헤더-푸터 크기 불일치. (Header: %lu, Footer: %lu)",
+                    block_count, bh->size, bf->size);
+            return SHM_ERR_CORRUPT;
+        }
+
+        // 3. 통계 데이터 검증 유효성 누적
+        int is_free = bh->flags & 1u;
+        if (!is_free) {
+            // 할당된 블록인 경우 메타데이터 바이트 수 누적
+            calculated_used_bytes += (bh->size + sizeof(BlockHeader) + sizeof(BlockFooter));
+        } else {
+            // 프리 블록인 경우 Bin 인덱스가 올바른 범위 내에 유효한지 체크
+            uint32_t bin_idx = (bh->flags >> 8) & 0x1Fu;
+            if (bin_idx >= BIN_COUNT) {
+                LOG_ERR("MREDIS [CORRUPTION DETECTED]: 프리 블록 [%lu]의 Bin 인덱스 범위 초과. (Bin: %u)",
+                        block_count, bin_idx);
+                return SHM_ERR_CORRUPT;
+            }
+        }
+
+        // 다음 인접 물리 블록 오프셋으로 이동
+        current_off += (sizeof(BlockHeader) + bh->size + sizeof(BlockFooter));
+    }
+
+    // 4. 최종 누적 실측치와 헤더 메타데이터 비교 검증
+    if (hh->used_bytes != calculated_used_bytes) {
+        LOG_WARN("MREDIS [INTEGRITY WARN]: 힙 헤더의 사용량 필드 불일치. (Header: %lu, 실측치: %lu) -> 동기화 수행.",
+                 hh->used_bytes, calculated_used_bytes);
+        // 복구 가능한 메타데이터는 실측치로 자동 동기화 보정
+        hh->used_bytes = calculated_used_bytes;
+    }
+
+    LOG_INFO("MREDIS [INTEGRITY PASS]: 총 %lu개 물리 블록 검증 완료. 오염 없음.", block_count);
+    return SHM_OK;
+}
+
 /* ── 공개 heap API (heap_mutex 직렬화) ──────────────────── */
-uint64_t heap_alloc(ShmHandle *h, uint64_t size)
+uint64_t heap_alloc(MRedisHandle *h, uint64_t size)
 {
     HeapHeader *hh = core_heap_hdr(h);
     int rc = pthread_mutex_lock(&hh->heap_mutex);
-    if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->heap_mutex);
+	if ((errno = mredis_recover_and_audit(h, rc)) != SHM_OK) {
+        // 힙 헤더 파괴가 확인되면 다른 프로세스들을 보호하기 위해 락을 풀고 강제 리턴
+        pthread_mutex_unlock(&hh->heap_mutex);
+        return OFFSET_NULL;
+    }
     uint64_t off = heap_alloc_locked(h, size);
     pthread_mutex_unlock(&hh->heap_mutex);
     return off;
 }
-int heap_free(ShmHandle *h, uint64_t data)
+int heap_free(MRedisHandle *h, uint64_t data)
 {
     if (data == OFFSET_NULL) return SHM_OK;
     HeapHeader *hh = core_heap_hdr(h);
@@ -452,7 +517,7 @@ int heap_free(ShmHandle *h, uint64_t data)
 static void calc_layout(uint64_t sz, uint64_t *ob, uint64_t *ohh,
                          uint64_t *ohs, uint64_t *ohsz)
 {
-    uint64_t off = (sizeof(ShmHeader) + 7ULL) & ~7ULL;
+    uint64_t off = (sizeof(MRedisHeader) + 7ULL) & ~7ULL;
     *ob = off;
     off += (uint64_t)HASH_TABLE_SIZE * sizeof(BucketEntry);
     off  = (off + 7ULL) & ~7ULL;
@@ -465,7 +530,7 @@ static void calc_layout(uint64_t sz, uint64_t *ob, uint64_t *ohh,
              *ob, *ohh, (*ohsz) >> 20);
 }
 
-static void heap_init_region(ShmHandle *h, uint64_t hs, uint64_t hsz)
+static void heap_init_region(MRedisHandle *h, uint64_t hs, uint64_t hsz)
 {
     HeapHeader *hh = core_heap_hdr(h);
 
@@ -495,10 +560,9 @@ static void heap_init_region(ShmHandle *h, uint64_t hs, uint64_t hsz)
 	f->magic = HEAP_BLOCK_MAGIC;
     hh->free_bins[bin] = hs;
 
-    LOG_INFO("Segregated Fit + Coalescing(Next only) Heap 초기화 완료 (%lu MB)", hsz >> 20);
+    LOG_INFO("Segregated Fit + Coalescing Heap 초기화 완료 (%lu MB)", hsz >> 20);
 }
 
-/* ── mutex 속성 헬퍼 (프로세스 공유 + robust) ────────────── */
 static void mutex_attr_ps_robust(pthread_mutexattr_t *ma)
 {
     pthread_mutexattr_init(ma);
@@ -506,9 +570,9 @@ static void mutex_attr_ps_robust(pthread_mutexattr_t *ma)
     pthread_mutexattr_setrobust(ma,  PTHREAD_MUTEX_ROBUST);
 }
 
-ShmHandle *shm_create(const char *name, uint64_t size)
+MRedisHandle *mredis_create(const char *name, uint64_t size)
 {
-    LOG_INFO("shm_create: %s %lu MB", name, size >> 20);
+    LOG_INFO("mredis_create: %s %lu MB", name, size >> 20);
     if (size < (16ULL << 20)) size = 16ULL << 20;
 
     int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0666);
@@ -519,7 +583,7 @@ ShmHandle *shm_create(const char *name, uint64_t size)
     if (base == MAP_FAILED) { close(fd); shm_unlink(name); return NULL; }
     memset(base, 0, size);
 
-    ShmHandle *h = (ShmHandle *)malloc(sizeof(ShmHandle));
+    MRedisHandle *h = (MRedisHandle *)malloc(sizeof(MRedisHandle));
     if (!h) {
 		munmap(base, size);
 		close(fd);
@@ -540,15 +604,14 @@ ShmHandle *shm_create(const char *name, uint64_t size)
 		return NULL; 
 	}
 
-    ShmHeader *s = (ShmHeader *)base;
-    s->shm_size          = size;
+    MRedisHeader *s = (MRedisHeader *)base;
+    s->mredis_size       = size;
     s->bucket_offset     = bo;
     s->heap_header_offset = hho;
     s->hash_table_size   = (uint32_t)HASH_TABLE_SIZE;
     s->version           = 5;
     s->initialized       = 0;
 
-    /* BucketEntry mutex 일괄 초기화 */
     pthread_mutexattr_t ma;
     mutex_attr_ps_robust(&ma);
     BucketEntry *bk = (BucketEntry *)((uint8_t *)base + bo);
@@ -560,38 +623,44 @@ ShmHandle *shm_create(const char *name, uint64_t size)
 
     heap_init_region(h, hs, hsz);
     s->initialized = 1;
-    LOG_INFO("shm_create 완료 ver=%u", s->version);
+    LOG_INFO("mredis_create 완료 ver=%u", s->version);
     return h;
 }
 
-ShmHandle *shm_open_existing(const char *name)
+MRedisHandle *mredis_open_existing(const char *name)
 {
     int fd = shm_open(name, O_RDWR, 0666);
-    if (fd < 0) { LOG_ERR("shm_open: %s", strerror(errno)); return NULL; }
+    if (fd < 0) { LOG_ERR("mredis_open: %s", strerror(errno)); return NULL; }
     struct stat st; fstat(fd, &st);
     uint64_t size = (uint64_t)st.st_size;
     void *base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { close(fd); return NULL; }
-    if (!((ShmHeader *)base)->initialized) { munmap(base, size); close(fd); return NULL; }
-    ShmHandle *h = (ShmHandle *)malloc(sizeof(ShmHandle));
+    if (!((MRedisHeader *)base)->initialized) { munmap(base, size); close(fd); return NULL; }
+    MRedisHandle *h = (MRedisHandle *)malloc(sizeof(MRedisHandle));
     if (!h) { munmap(base, size); close(fd); return NULL; }
     h->base = base; h->fd = fd; h->size = size;
-    LOG_INFO("shm_open_existing: %s %lu MB", name, size >> 20);
+    LOG_INFO("mredis_open_existing: %s %lu MB", name, size >> 20);
     return h;
 }
 
-void shm_close(ShmHandle *h)   { if (h) { munmap(h->base, h->size); close(h->fd); free(h); } }
-void shm_destroy(const char *name) { shm_unlink(name); }
+void mredis_close(MRedisHandle *h)   {
+	if (h) {
+		mredis_heap_validate_integrity(h);
+		munmap(h->base, h->size);
+		close(h->fd); free(h);
+	}
+}
+void mredis_destroy(const char *name) { shm_unlink(name); }
 
-void shm_dump_stats(ShmHandle *h)
+void mredis_dump_stats(MRedisHandle *h)
 {
     if (!h) return;
-    ShmHeader *s  = core_shm_hdr(h);
+    MRedisHeader *s  = core_mredis_hdr(h);
     HeapHeader *hh = core_heap_hdr(h);
     fprintf(stderr,
             "=== MREDIS SHM 통계 (ver%u) ===\n  SHM=%lu MB  버킷=0x%x\n"
             "  힙=%lu MB  사용=%lu KB  잔여=%lu MB\n  alloc/free=%lu/%lu\n",
-            s->version, s->shm_size >> 20, s->hash_table_size,
+            s->version, s->mredis_size >> 20, s->hash_table_size,
             hh->heap_size >> 20, hh->used_bytes >> 10,
             (hh->heap_size - hh->used_bytes) >> 20,
             hh->total_alloc, hh->total_free);
@@ -607,7 +676,7 @@ void shm_dump_stats(ShmHandle *h)
 }
 
 /* ── 버킷 ────────────────────────────────────────────────── */
-void bucket_lock(ShmHandle *h, uint32_t idx)
+void bucket_lock(MRedisHandle *h, uint32_t idx)
 {
     BucketEntry *bk = core_get_bucket(h, idx);
     int rc = pthread_mutex_lock(&bk->mutex);
@@ -617,7 +686,7 @@ void bucket_lock(ShmHandle *h, uint32_t idx)
     }
 }
 
-uint64_t bucket_find_locked(ShmHandle *h, BucketEntry *bk, const void *key, uint32_t klen, uint32_t tf, uint64_t *op)
+uint64_t bucket_find_locked(MRedisHandle *h, BucketEntry *bk, const void *key, uint32_t klen, uint32_t tf, uint64_t *op)
 {
     uint64_t prev = OFFSET_NULL, cur = bk->head_offset;
     while (cur != OFFSET_NULL) {
@@ -634,7 +703,7 @@ uint64_t bucket_find_locked(ShmHandle *h, BucketEntry *bk, const void *key, uint
     return OFFSET_NULL;
 }
 
-uint64_t bucket_find(ShmHandle *h, uint32_t idx,
+uint64_t bucket_find(MRedisHandle *h, uint32_t idx,
                       const void *key, uint32_t klen,
                       uint32_t tf, uint64_t *op)
 {
@@ -645,18 +714,37 @@ uint64_t bucket_find(ShmHandle *h, uint32_t idx,
     return ne;
 }
 
-/* ── NameEntry ───────────────────────────────────────────── */
-uint64_t nameentry_alloc(ShmHandle *h, const void *key, uint32_t klen,
+/* [FIXED-3] nameentry_alloc: 내부 락 획득 순서 원자화 및 롤백 로직 메모리 누수 해결 */
+uint64_t nameentry_alloc(MRedisHandle *h, const void *key, uint32_t klen,
                           uint32_t type, uint64_t data_off)
 {
-    uint64_t ne_off = heap_alloc(h, sizeof(NameEntry));
-    uint64_t ko     = heap_alloc(h, klen > 0 ? klen : 1);
-    if (ne_off == OFFSET_NULL || ko == OFFSET_NULL) {
-        if (ne_off != OFFSET_NULL) heap_free(h, ne_off);
-        if (ko     != OFFSET_NULL) heap_free(h, ko);
+    if (klen == 0) return OFFSET_NULL; // 방어 코드
+
+    HeapHeader *hh = core_heap_hdr(h);
+    uint64_t ne_off = OFFSET_NULL;
+    uint64_t ko = OFFSET_NULL;
+
+    // 대형 락(heap_mutex)을 명시적으로 한 번만 획득하여 두 할당의 원자성을 100% 보장
+    int rc = pthread_mutex_lock(&hh->heap_mutex);
+    if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->heap_mutex);
+
+    ne_off = heap_alloc_locked(h, sizeof(NameEntry));
+    if (ne_off != OFFSET_NULL) {
+        ko = heap_alloc_locked(h, klen);
+        if (ko == OFFSET_NULL) {
+            // 원자적 롤백: 락이 걸린 상태에서 즉시 프리
+            heap_free_locked(h, ne_off);
+            ne_off = OFFSET_NULL;
+        }
+    }
+
+    pthread_mutex_unlock(&hh->heap_mutex);
+
+    if (ne_off == OFFSET_NULL) {
         return OFFSET_NULL;
     }
-    if (klen > 0) memcpy(OFF2PTR(h, ko), key, klen);
+
+    memcpy(OFF2PTR(h, ko), key, klen);
     NameEntry *ne = (NameEntry *)OFF2PTR(h, ne_off);
     ne->next_offset = OFFSET_NULL;
     ne->key_offset  = ko;
@@ -666,134 +754,19 @@ uint64_t nameentry_alloc(ShmHandle *h, const void *key, uint32_t klen,
     return ne_off;
 }
 
-void nameentry_free(ShmHandle *h, uint64_t ne_off)
+void nameentry_free(MRedisHandle *h, uint64_t ne_off)
 {
     if (ne_off == OFFSET_NULL) return;
     NameEntry *ne = (NameEntry *)OFF2PTR(h, ne_off);
-    heap_free(h, ne->key_offset);
-    heap_free(h, ne_off);
-}
+    
+    HeapHeader *hh = core_heap_hdr(h);
+    int rc = pthread_mutex_lock(&hh->heap_mutex);
+    if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->heap_mutex);
 
-/* ── ZSet / Hash 조회 ────────────────────────────────────── */
-ZSetHeader *core_zset_get(ShmHandle *h, const void *name, uint32_t nlen)
-{
-    uint64_t ne = bucket_find(h, shm_hash(name, nlen), name, nlen, ENTRY_ZSET, NULL);
-    if (ne == OFFSET_NULL) return NULL;
-    return (ZSetHeader *)OFF2PTR(h, ((NameEntry *)OFF2PTR(h, ne))->data_offset);
-}
-
-HashHeader *core_hash_get(ShmHandle *h, const void *key, uint32_t klen)
-{
-    uint64_t ne = bucket_find(h, shm_hash(key, klen), key, klen, ENTRY_HASH, NULL);
-    if (ne == OFFSET_NULL) return NULL;
-    return (HashHeader *)OFF2PTR(h, ((NameEntry *)OFF2PTR(h, ne))->data_offset);
-}
-
-/* ── Skip List ───────────────────────────────────────────── */
-uint32_t sl_random_level(void)
-{
-    static __thread uint32_t rng = 0;
-    if (!rng) {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        rng = (uint32_t)(ts.tv_nsec ^ (uintptr_t)&rng) | 1u;
+    if (ne->key_offset != OFFSET_NULL) {
+        heap_free_locked(h, ne->key_offset);
     }
-    uint32_t lv = 1;
-    while (lv < ZSET_MAX_LEVEL) {
-        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-        if ((rng & 0xFFFF) < (uint32_t)(0xFFFF * ZSET_P)) lv++;
-        else break;
-    }
-    return lv;
-}
+    heap_free_locked(h, ne_off);
 
-int sl_cmp(double s1, const void *m1, uint32_t ml1,
-           double s2, const void *m2, uint32_t ml2)
-{
-    if (s1 < s2) return -1;
-    if (s1 > s2) return  1;
-    uint32_t mn = ml1 < ml2 ? ml1 : ml2;
-    int r = (m1 && m2) ? memcmp(m1, m2, mn) : 0;
-    if (r) return r;
-    return (ml1 < ml2) ? -1 : (ml1 > ml2) ? 1 : 0;
-}
-
-uint64_t sl_find_update(ShmHandle *h, ZSetHeader *zsh,
-                         double sc, const void *m, uint32_t ml,
-                         uint64_t upd[ZSET_MAX_LEVEL])
-{
-    uint64_t x = zsh->head_offset;
-    for (int i = (int)zsh->cur_level - 1; i >= 0; i--) {
-        SkipNode *sn = core_sn(h, x);
-        while (sn->forward[i] != OFFSET_NULL) {
-            SkipNode *nx = core_sn(h, sn->forward[i]);
-            void *nm = (nx->member_offset != OFFSET_NULL)
-                       ? OFF2PTR(h, nx->member_offset) : NULL;
-            if (sl_cmp(nx->score, nm, nx->member_len, sc, m, ml) < 0) {
-                x = sn->forward[i]; sn = nx;
-            } else break;
-        }
-        upd[i] = x;
-    }
-    return core_sn(h, x)->forward[0];
-}
-
-uint64_t sl_find_member(ShmHandle *h, ZSetHeader *zsh,
-                         const void *m, uint32_t ml)
-{
-    uint64_t cur = core_sn(h, zsh->head_offset)->forward[0];
-    while (cur != OFFSET_NULL) {
-        SkipNode *sn = core_sn(h, cur);
-        if (sn->member_len == ml &&
-            memcmp(OFF2PTR(h, sn->member_offset), m, ml) == 0)
-            return cur;
-        cur = sn->forward[0];
-    }
-    return OFFSET_NULL;
-}
-
-uint64_t sl_node_alloc(ShmHandle *h, double sc,
-                        const void *m, uint32_t ml, uint32_t lv)
-{
-    uint64_t n  = heap_alloc(h, sizeof(SkipNode));
-    uint64_t mo = heap_alloc(h, ml > 0 ? ml : 1);
-    if (n == OFFSET_NULL || mo == OFFSET_NULL) {
-        if (n  != OFFSET_NULL) heap_free(h, n);
-        if (mo != OFFSET_NULL) heap_free(h, mo);
-        return OFFSET_NULL;
-    }
-    if (ml > 0) memcpy(OFF2PTR(h, mo), m, ml);
-    SkipNode *sn = core_sn(h, n);
-    sn->score          = sc;
-    sn->member_offset  = mo;
-    sn->member_len     = ml;
-    sn->level_count    = lv;
-    sn->backward_offset = OFFSET_NULL;
-    for (int i = 0; i < ZSET_MAX_LEVEL; i++) sn->forward[i] = OFFSET_NULL;
-    return n;
-}
-
-void sl_node_free(ShmHandle *h, uint64_t n)
-{
-    if (n == OFFSET_NULL) return;
-    heap_free(h, core_sn(h, n)->member_offset);
-    heap_free(h, n);
-}
-
-void sl_unlink(ShmHandle *h, ZSetHeader *zsh,
-               uint64_t n_off, uint64_t upd[ZSET_MAX_LEVEL])
-{
-    SkipNode *sn = core_sn(h, n_off);
-    for (int i = 0; i < (int)zsh->cur_level; i++)
-        if (core_sn(h, upd[i])->forward[i] == n_off)
-            core_sn(h, upd[i])->forward[i] = sn->forward[i];
-
-    if (sn->forward[0] != OFFSET_NULL)
-        core_sn(h, sn->forward[0])->backward_offset = upd[0];
-    else
-        zsh->tail_offset = upd[0];          /* 마지막 노드 제거 시 tail 갱신 */
-
-    while (zsh->cur_level > 1 &&
-           core_sn(h, zsh->head_offset)->forward[zsh->cur_level - 1] == OFFSET_NULL)
-        zsh->cur_level--;
+    pthread_mutex_unlock(&hh->heap_mutex);
 }

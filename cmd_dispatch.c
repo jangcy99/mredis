@@ -4,8 +4,8 @@
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_kv.h"
 #include "cmd_zset.h"
 #include "cmd_hash.h"
@@ -87,7 +87,7 @@ const CmdEntry *cmd_table_get(size_t *out_count) {
     return g_cmd_table;
 }
 
-s_replyObject *cmd_dispatch(ShmHandle *h, string_t *args[], uint32_t argc) {
+s_replyObject *cmd_dispatch(MRedisHandle *h, string_t *args[], uint32_t argc) {
     if (!h || !args || argc==0 || !args[0])
         return reply_error(SHM_ERR_INVAL, "빈 커맨드");
     const char *name = args[0]->ptr;

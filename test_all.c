@@ -21,14 +21,14 @@
 #include <pthread.h>
 #include <sys/wait.h>
 
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_dispatch.h"
 #include "cmd_del.h"
 #include "cmd_bset.h"
 #include "cmd_cset.h"
 
-#define SHM_NAME "/shm_mredis_all_test"
+#define SHM_NAME "/mredis_hashtable"
 #define PASS     "\033[32m[PASS]\033[0m"
 #define FAIL     "\033[31m[FAIL]\033[0m"
 #define SECT(t)  printf("\n\033[36m══ %s ══\033[0m\n",(t))
@@ -37,7 +37,7 @@ static int g_pass=0, g_fail=0;
 #define CHECK(c,m) do{ if(c){printf(PASS " %s\n",(m));g_pass++;} \
     else{printf(FAIL " %s  [L%d]\n",(m),__LINE__);g_fail++;} }while(0)
 
-static s_replyObject *run(ShmHandle *h, ...) {
+static s_replyObject *run(MRedisHandle *h, ...) {
     string_t *args[64]; string_t bufs[64]; uint32_t argc=0;
     va_list ap; va_start(ap,h);
     while(argc<64){ const char *s=va_arg(ap,const char*); if(!s) break;
@@ -57,7 +57,7 @@ static int arr_str(s_replyObject *r,size_t i,const char *s){
            r->element[i]->type==REPLY_STRING&&strcmp((char*)r->element[i]->ptr,s)==0; }
 
 /* ── §01 KV ─────────────────────────────────────────────── */
-static void t01_kv(ShmHandle *h) {
+static void t01_kv(MRedisHandle *h) {
     SECT("01. KV");
     s_replyObject *r;
     r=run(h,"SET","k1","hello",NULL); CHECK(is_ok(r),"SET→OK"); reply_free(r);
@@ -73,7 +73,7 @@ static void t01_kv(ShmHandle *h) {
 }
 
 /* ── §02 KEYS ───────────────────────────────────────────── */
-static void t02_keys(ShmHandle *h) {
+static void t02_keys(MRedisHandle *h) {
     SECT("02. KEYS");
     s_replyObject *r;
     run(h,"SET","key:a","1",NULL); run(h,"SET","key:b","2",NULL); run(h,"SET","other","3",NULL);
@@ -92,7 +92,7 @@ static void t02_keys(ShmHandle *h) {
 }
 
 /* ── §03 DEL 라우팅 ─────────────────────────────────────── */
-static void t03_del(ShmHandle *h) {
+static void t03_del(MRedisHandle *h) {
     SECT("03. DEL 라우팅 (KV/ZSET/HASH/BSET/CSET)");
     s_replyObject *r;
     run(h,"SET","dkv","v",NULL);
@@ -126,7 +126,7 @@ static void t03_del(ShmHandle *h) {
 }
 
 /* ── §04 ZSET ───────────────────────────────────────────── */
-static void t04_zset(ShmHandle *h) {
+static void t04_zset(MRedisHandle *h) {
     SECT("04. ZSET");
     s_replyObject *r;
     r=run(h,"ZCREATE","z1",NULL); CHECK(is_ok(r),"ZCREATE→OK"); reply_free(r);
@@ -150,7 +150,7 @@ static void t04_zset(ShmHandle *h) {
 }
 
 /* ── §05 HASH ───────────────────────────────────────────── */
-static void t05_hash(ShmHandle *h) {
+static void t05_hash(MRedisHandle *h) {
     SECT("05. HASH");
     s_replyObject *r;
     r=run(h,"HSET","user","name","Alice","age","30","city","Seoul",NULL);
@@ -173,7 +173,7 @@ static void t05_hash(ShmHandle *h) {
 }
 
 /* ── §06 BSET ───────────────────────────────────────────── */
-static void t06_bset(ShmHandle *h) {
+static void t06_bset(MRedisHandle *h) {
     SECT("06. BSET (배열 기반, rwlock, Append Fast-Path)");
     s_replyObject *r;
 
@@ -238,7 +238,7 @@ static void t06_bset(ShmHandle *h) {
 }
 
 /* ── §07 CSET ───────────────────────────────────────────── */
-static void t07_cset(ShmHandle *h) {
+static void t07_cset(MRedisHandle *h) {
     SECT("07. CSET (청크 체인, 삭제비트, 자동병합, CCOMPACT)");
     s_replyObject *r;
 
@@ -333,7 +333,7 @@ static void t07_cset(ShmHandle *h) {
 /* ── §08 직렬화 (멀티스레드) ────────────────────────────── */
 #define MT_THREADS 8
 #define MT_OPS     200
-typedef struct { ShmHandle *h; int id; } MtArg;
+typedef struct { MRedisHandle *h; int id; } MtArg;
 
 static void *mt_kv_w(void *a){ MtArg *x=(MtArg*)a;
     for(int i=0;i<MT_OPS;i++){ char k[32],v[32];
@@ -354,7 +354,7 @@ static void *mt_cset_w(void *a){ MtArg *x=(MtArg*)a;
         string_t *ar[]={&a0,&a1,&a2,&a3}; s_replyObject *r=cmd_dispatch(x->h,ar,4); reply_free(r); }
     return NULL; }
 
-static void t08_serialize(ShmHandle *h) {
+static void t08_serialize(MRedisHandle *h) {
     SECT("08. 직렬화 (멀티스레드 rwlock 검증)");
     pthread_t tids[MT_THREADS]; MtArg args[MT_THREADS];
 
@@ -388,12 +388,12 @@ static void t08_serialize(ShmHandle *h) {
 /* ── §09 ZINCRBY TOCTOU ─────────────────────────────────── */
 #define ZINCRBY_T 8
 #define ZINCRBY_I 100
-static void *zincrby_w(void *a){ ShmHandle *h=(ShmHandle*)a;
+static void *zincrby_w(void *a){ MRedisHandle *h=(MRedisHandle*)a;
     for(int i=0;i<ZINCRBY_I;i++){
         string_t a0={"ZINCRBY",7},a1={"tc_z",4},a2={"1",1},a3={"counter",7};
         string_t *ar[]={&a0,&a1,&a2,&a3}; s_replyObject *r=cmd_dispatch(h,ar,4); reply_free(r); }
     return NULL; }
-static void t09_zincrby(ShmHandle *h) {
+static void t09_zincrby(MRedisHandle *h) {
     SECT("09. ZINCRBY TOCTOU 수정 검증");
     pthread_t tids[ZINCRBY_T];
     for(int i=0;i<ZINCRBY_T;i++) pthread_create(&tids[i],NULL,zincrby_w,h);
@@ -407,48 +407,52 @@ static void t09_zincrby(ShmHandle *h) {
 /* ── §10 멀티프로세스 stress ─────────────────────────────── */
 #define MP_PROCS 8
 #define MP_ITER  500
-static void mp_worker(const char *nm, int id){ ShmHandle *h=shm_open_existing(nm);
+static void mp_worker(const char *nm, int id){ MRedisHandle *h=mredis_open_existing(nm);
     if(!h) exit(1);
     for(int i=0;i<MP_ITER;i++){ char k[32],v[32];
         snprintf(k,32,"mp_%d_%d",id,i); snprintf(v,32,"v%d",i);
         string_t sk={k,(uint32_t)strlen(k)},sv={v,(uint32_t)strlen(v)},sc={"SET",3};
         string_t *ar[]={&sc,&sk,&sv}; s_replyObject *r=cmd_dispatch(h,ar,3); reply_free(r); }
-    shm_close(h); exit(0); }
-static void t10_mp(ShmHandle *h){ SECT("10. 멀티프로세스 stress (8×500)");
+    mredis_close(h); exit(0); }
+static void t10_mp(MRedisHandle *h){ SECT("10. 멀티프로세스 stress (8×500)");
     (void)h; pid_t pids[MP_PROCS];
     for(int i=0;i<MP_PROCS;i++){ pids[i]=fork(); if(pids[i]==0){ mp_worker(SHM_NAME,i); exit(0); } }
     for(int i=0;i<MP_PROCS;i++) waitpid(pids[i],NULL,0);
-    ShmHandle *vh=shm_open_existing(SHM_NAME); int ok=1;
+    MRedisHandle *vh=mredis_open_existing(SHM_NAME); int ok=1;
     for(int i=0;i<MP_PROCS&&ok;i++) for(int j=0;j<MP_ITER&&ok;j++){
         char k[32]; snprintf(k,32,"mp_%d_%d",i,j);
         string_t sk={k,(uint32_t)strlen(k)},sc={"GET",3}; string_t *a[]={&sc,&sk};
         s_replyObject *r=cmd_dispatch(vh,a,2);
         if(!r||r->type!=REPLY_STRING) ok=0;
         reply_free(r); }
-    CHECK(ok,"멀티프로세스: 모든 키 정상 저장"); shm_close(vh); }
+    CHECK(ok,"멀티프로세스: 모든 키 정상 저장"); mredis_close(vh); }
 
 /* ── main ───────────────────────────────────────────────── */
 int main(void) {
     printf("╔══════════════════════════════════════════════╗\n");
     printf("║     mredis 전체 통합 테스트 (§01~§10)        ║\n");
     printf("╚══════════════════════════════════════════════╝\n");
-    shm_destroy(SHM_NAME);
-    ShmHandle *h=shm_create(SHM_NAME,512ULL*1024*1024);
+    mredis_destroy(SHM_NAME);
+    MRedisHandle *h=mredis_create(SHM_NAME,512ULL*1024*1024);
     if(!h){ fprintf(stderr,"SHM 생성 실패\n"); return 1; }
-    shm_set_debug_level(DBG_ERROR);
+    mredis_set_debug_level(DBG_ERROR);
     t01_kv(h); t02_keys(h); t03_del(h); t04_zset(h); t05_hash(h);
     t06_bset(h); t07_cset(h); t08_serialize(h); t09_zincrby(h); t10_mp(h);
 
 #if 1
 	s_replyObject *r = run(h, "KEYS", "*", NULL);
 	for (size_t i=0;i<r->elements;i++)	{
+		printf ("%s\n", (char*)r->element[i]->ptr);
+#if 0
 		reply_free(run(h, "DEL", r->element[i]->ptr, NULL));
+#endif
 	}
 	reply_free(r);
 #endif
 
-	shm_dump_stats(h);
-    shm_close(h); shm_destroy(SHM_NAME);
+	mredis_dump_stats(h);
+    mredis_close(h);
+//	mredis_destroy(SHM_NAME);
     printf("\n══════════════════════════════════════════════\n");
     printf("결과: \033[32mPASS %d\033[0m / \033[31mFAIL %d\033[0m / 합계 %d\n",
            g_pass,g_fail,g_pass+g_fail);

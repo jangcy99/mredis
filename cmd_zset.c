@@ -21,12 +21,20 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
+#include "skiplist.h"
 #include "cmd_zset.h"
 
+/* ── ZSet / Hash 조회 ────────────────────────────────────── */
+static ZSetHeader *core_zset_get(MRedisHandle *h, const void *name, uint32_t nlen)
+{
+    uint64_t ne = bucket_find(h, mredis_hash(name, nlen)%((MRedisHeader*)(h->base))->hash_table_size, name, nlen, ENTRY_ZSET, NULL);
+    if (ne == OFFSET_NULL) return NULL;
+    return (ZSetHeader *)OFF2PTR(h, ((NameEntry *)OFF2PTR(h, ne))->data_offset);
+}
 /* ── 키 타입 검사 (버킷 잠긴 상태) ──────────────────────── */
-static int zset_type_check(ShmHandle *h, BucketEntry *bk,
+static int zset_type_check(MRedisHandle *h, BucketEntry *bk,
                              const void *key, uint32_t klen,
                              uint64_t *out_ne)
 {
@@ -39,7 +47,7 @@ static int zset_type_check(ShmHandle *h, BucketEntry *bk,
 }
 
 /* ── ZSetHeader + HEAD 노드 생성 (버킷 잠긴 상태) ────────── */
-static int zset_create_locked(ShmHandle *h, BucketEntry *bk,
+static int zset_create_locked(MRedisHandle *h, BucketEntry *bk,
                                 const void *key, uint32_t klen)
 {
     uint64_t zsh_off = heap_alloc(h, sizeof(ZSetHeader));
@@ -66,9 +74,9 @@ static int zset_create_locked(ShmHandle *h, BucketEntry *bk,
     hd->score           = -__builtin_inf();
     hd->member_offset   = OFFSET_NULL;
     hd->member_len      = 0;
-    hd->level_count     = ZSET_MAX_LEVEL;
+    hd->level_count     = SL_MAX_LEVEL;
     hd->backward_offset = OFFSET_NULL;
-    for (int i = 0; i < ZSET_MAX_LEVEL; i++) hd->forward[i] = OFFSET_NULL;
+    for (int i = 0; i < SL_MAX_LEVEL; i++) hd->forward[i] = OFFSET_NULL;
     zsh->head_offset = hd_off;
 
     uint64_t ne_off = nameentry_alloc(h, key, klen, ENTRY_ZSET, zsh_off);
@@ -84,14 +92,14 @@ static int zset_create_locked(ShmHandle *h, BucketEntry *bk,
 }
 
 /* ── 얻기, 없으면 자동 생성 ─────────────────────────────── */
-static ZSetHeader *zset_get_or_create(ShmHandle *h,
+static ZSetHeader *zset_get_or_create(MRedisHandle *h,
                                        const void *key, uint32_t klen,
                                        int *err)
 {
     ZSetHeader *zsh = core_zset_get(h, key, klen);
     if (zsh) { if (err) *err = SHM_OK; return zsh; }
 
-    uint32_t idx    = shm_hash(key, klen);
+    uint32_t idx    = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -117,32 +125,32 @@ static ZSetHeader *zset_get_or_create(ShmHandle *h,
 }
 
 /* ── ZCREATE ─────────────────────────────────────────────── */
-s_replyObject *cmd_zcreate(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zcreate(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: ZCREATE key");
     const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
-    uint32_t idx = shm_hash(key, klen);
+    uint32_t idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk = core_get_bucket(h, idx);
     bucket_lock(h, idx);
     uint64_t ne_off = OFFSET_NULL;
     int chk = zset_type_check(h, bk, key, klen, &ne_off);
     if (chk == SHM_ERR_KEY_EXISTS) {
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_KEY_EXISTS, shm_strerror(SHM_ERR_KEY_EXISTS));
+        return reply_error(SHM_ERR_KEY_EXISTS, mredis_strerror(SHM_ERR_KEY_EXISTS));
     }
     if (chk == 0) { pthread_mutex_unlock(&bk->mutex); return reply_ok(); }
     int r = zset_create_locked(h, bk, key, klen);
     pthread_mutex_unlock(&bk->mutex);
-    return r == SHM_OK ? reply_ok() : reply_error(r, shm_strerror(r));
+    return r == SHM_OK ? reply_ok() : reply_error(r, mredis_strerror(r));
 }
 
 /* ── ZDROP ───────────────────────────────────────────────── */
-s_replyObject *cmd_zdrop(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zdrop(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: ZDROP key");
     const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
 
-    uint32_t idx    = shm_hash(key, klen);
+    uint32_t idx    = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -150,7 +158,7 @@ s_replyObject *cmd_zdrop(ShmHandle *h, string_t *args[], uint32_t argc)
     uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_ZSET, &prev);
     if (ne_off == OFFSET_NULL) {
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_NOT_FOUND, shm_strerror(SHM_ERR_NOT_FOUND));
+        return reply_error(SHM_ERR_NOT_FOUND, mredis_strerror(SHM_ERR_NOT_FOUND));
     }
     NameEntry   *ne     = (NameEntry *)OFF2PTR(h, ne_off);
     uint64_t     zsh_off = ne->data_offset;
@@ -178,7 +186,7 @@ s_replyObject *cmd_zdrop(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── ZADD ────────────────────────────────────────────────── */
-s_replyObject *cmd_zadd(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zadd(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4) return reply_error(SHM_ERR_ARGC, "usage: ZADD key score member");
     const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
@@ -198,7 +206,7 @@ s_replyObject *cmd_zadd(ShmHandle *h, string_t *args[], uint32_t argc)
 
     int err = SHM_OK;
     ZSetHeader *zsh = zset_get_or_create(h, key, klen, &err);
-    if (!zsh) return reply_error(err, shm_strerror(err));
+    if (!zsh) return reply_error(err, mredis_strerror(err));
 
     int rc = pthread_mutex_lock(&zsh->mutex);
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&zsh->mutex);
@@ -217,7 +225,7 @@ s_replyObject *cmd_zadd(ShmHandle *h, string_t *args[], uint32_t argc)
             return reply_error(SHM_ERR_INVAL, "member 비어있음");
         }
 
-        uint64_t update[ZSET_MAX_LEVEL];
+        uint64_t update[SL_MAX_LEVEL];
         uint64_t exist_off = sl_find_member(h, zsh, member, mlen);
         SkipNode *existing = (exist_off != OFFSET_NULL) ? core_sn(h, exist_off) : NULL;
 
@@ -244,7 +252,7 @@ s_replyObject *cmd_zadd(ShmHandle *h, string_t *args[], uint32_t argc)
                     existing->forward[li] = core_sn(h, update[li])->forward[li];
                     core_sn(h, update[li])->forward[li] = exist_off;
                 }
-                for (uint32_t li = lv; li < ZSET_MAX_LEVEL; li++)
+                for (uint32_t li = lv; li < SL_MAX_LEVEL; li++)
                     existing->forward[li] = OFFSET_NULL;
                 if (existing->forward[0] != OFFSET_NULL)
                     core_sn(h, existing->forward[0])->backward_offset = exist_off;
@@ -265,7 +273,7 @@ s_replyObject *cmd_zadd(ShmHandle *h, string_t *args[], uint32_t argc)
             uint64_t n = sl_node_alloc(h, score, member, mlen, lv);
             if (n == OFFSET_NULL) {
                 pthread_mutex_unlock(&zsh->mutex);
-                return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+                return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
             }
             SkipNode *sn = core_sn(h, n);
             for (uint32_t li = 0; li < lv; li++) {
@@ -286,7 +294,7 @@ s_replyObject *cmd_zadd(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── ZREM ────────────────────────────────────────────────── */
-s_replyObject *cmd_zrem(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zrem(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3) return reply_error(SHM_ERR_ARGC, "usage: ZREM key member");
     ZSetHeader *zsh = core_zset_get(h, args[1]->ptr, args[1]->len);
@@ -297,7 +305,7 @@ s_replyObject *cmd_zrem(ShmHandle *h, string_t *args[], uint32_t argc)
     for (uint32_t i = 2; i < argc; i++) {
         uint64_t n = sl_find_member(h, zsh, args[i]->ptr, args[i]->len);
         if (n == OFFSET_NULL) continue;
-        uint64_t upd[ZSET_MAX_LEVEL];
+        uint64_t upd[SL_MAX_LEVEL];
         SkipNode *sn = core_sn(h, n);
         sl_find_update(h, zsh, sn->score,
                        OFF2PTR(h, sn->member_offset), sn->member_len, upd);
@@ -311,7 +319,7 @@ s_replyObject *cmd_zrem(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── ZSCORE ──────────────────────────────────────────────── */
-s_replyObject *cmd_zscore(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zscore(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3) return reply_error(SHM_ERR_ARGC, "usage: ZSCORE key member");
     ZSetHeader *zsh = core_zset_get(h, args[1]->ptr, args[1]->len);
@@ -329,7 +337,7 @@ s_replyObject *cmd_zscore(ShmHandle *h, string_t *args[], uint32_t argc)
 /* ── ZINCRBY ─────────────────────────────────────────────
  * [FIX-1] 조회 + 삽입을 동일 mutex 구간으로 묶어 TOCTOU 제거.
  * ─────────────────────────────────────────────────────── */
-s_replyObject *cmd_zincrby(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zincrby(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4) return reply_error(SHM_ERR_ARGC, "usage: ZINCRBY key delta member");
     char *ep = NULL;
@@ -339,7 +347,7 @@ s_replyObject *cmd_zincrby(ShmHandle *h, string_t *args[], uint32_t argc)
 
     int err = SHM_OK;
     ZSetHeader *zsh = zset_get_or_create(h, args[1]->ptr, args[1]->len, &err);
-    if (!zsh) return reply_error(err, shm_strerror(err));
+    if (!zsh) return reply_error(err, mredis_strerror(err));
 
     int rc = pthread_mutex_lock(&zsh->mutex);
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&zsh->mutex);
@@ -351,7 +359,7 @@ s_replyObject *cmd_zincrby(ShmHandle *h, string_t *args[], uint32_t argc)
         new_sc = core_sn(h, exist_off)->score + delta;
 
     /* score 갱신 (mutex 유지 상태에서 인라인 처리) */
-    uint64_t update[ZSET_MAX_LEVEL];
+    uint64_t update[SL_MAX_LEVEL];
     if (exist_off != OFFSET_NULL) {
         SkipNode *sn = core_sn(h, exist_off);
         sl_find_update(h, zsh, sn->score,
@@ -370,7 +378,7 @@ s_replyObject *cmd_zincrby(ShmHandle *h, string_t *args[], uint32_t argc)
             sn->forward[li] = core_sn(h, update[li])->forward[li];
             core_sn(h, update[li])->forward[li] = exist_off;
         }
-        for (uint32_t li = lv; li < ZSET_MAX_LEVEL; li++)
+        for (uint32_t li = lv; li < SL_MAX_LEVEL; li++)
             sn->forward[li] = OFFSET_NULL;
         if (sn->forward[0] != OFFSET_NULL)
             core_sn(h, sn->forward[0])->backward_offset = exist_off;
@@ -388,7 +396,7 @@ s_replyObject *cmd_zincrby(ShmHandle *h, string_t *args[], uint32_t argc)
         uint64_t n = sl_node_alloc(h, new_sc, member, mlen, lv);
         if (n == OFFSET_NULL) {
             pthread_mutex_unlock(&zsh->mutex);
-            return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+            return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
         }
         SkipNode *sn = core_sn(h, n);
         for (uint32_t li = 0; li < lv; li++) {
@@ -409,7 +417,7 @@ s_replyObject *cmd_zincrby(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── ZRANK / ZREVRANK ────────────────────────────────────── */
-static s_replyObject *zrank_impl(ShmHandle *h, string_t *args[],
+static s_replyObject *zrank_impl(MRedisHandle *h, string_t *args[],
                                   uint32_t argc, int rev)
 {
     if (argc < 3) return reply_error(SHM_ERR_ARGC,
@@ -432,11 +440,11 @@ static s_replyObject *zrank_impl(ShmHandle *h, string_t *args[],
     if (found < 0) return reply_nil();
     return reply_integer(rev ? len - 1 - found : found);
 }
-s_replyObject *cmd_zrank   (ShmHandle *h, string_t *args[], uint32_t argc) { return zrank_impl(h, args, argc, 0); }
-s_replyObject *cmd_zrevrank(ShmHandle *h, string_t *args[], uint32_t argc) { return zrank_impl(h, args, argc, 1); }
+s_replyObject *cmd_zrank   (MRedisHandle *h, string_t *args[], uint32_t argc) { return zrank_impl(h, args, argc, 0); }
+s_replyObject *cmd_zrevrank(MRedisHandle *h, string_t *args[], uint32_t argc) { return zrank_impl(h, args, argc, 1); }
 
 /* ── ZCARD ───────────────────────────────────────────────── */
-s_replyObject *cmd_zcard(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zcard(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: ZCARD key");
     ZSetHeader *zsh = core_zset_get(h, args[1]->ptr, args[1]->len);
@@ -444,7 +452,7 @@ s_replyObject *cmd_zcard(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── ZCOUNT ──────────────────────────────────────────────── */
-s_replyObject *cmd_zcount(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zcount(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4) return reply_error(SHM_ERR_ARGC, "usage: ZCOUNT key min max");
     double mn = strtod(args[2]->ptr, NULL), mx = strtod(args[3]->ptr, NULL);
@@ -465,7 +473,7 @@ s_replyObject *cmd_zcount(ShmHandle *h, string_t *args[], uint32_t argc)
 }
 
 /* ── 범위 결과 → ARRAY 변환 ─────────────────────────────── */
-static s_replyObject *build_zrange_reply(ShmHandle *h,
+static s_replyObject *build_zrange_reply(MRedisHandle *h,
                                           uint64_t *nodes, int64_t count)
 {
     s_replyObject *arr = reply_array((size_t)(count * 2));
@@ -484,7 +492,7 @@ static s_replyObject *build_zrange_reply(ShmHandle *h,
 }
 
 /* ── ZRANGE ──────────────────────────────────────────────── */
-s_replyObject *cmd_zrange(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zrange(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4) return reply_error(SHM_ERR_ARGC, "usage: ZRANGE key start stop [REV]");
     int64_t start = strtoll(args[2]->ptr, NULL, 10);
@@ -508,7 +516,7 @@ s_replyObject *cmd_zrange(ShmHandle *h, string_t *args[], uint32_t argc)
     uint64_t *nodes = (uint64_t *)malloc((size_t)need * sizeof(uint64_t));
     if (!nodes) {
         pthread_mutex_unlock(&zsh->mutex);
-        return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+        return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
     }
     int64_t filled = 0;
 
@@ -533,11 +541,11 @@ s_replyObject *cmd_zrange(ShmHandle *h, string_t *args[], uint32_t argc)
     s_replyObject *arr = build_zrange_reply(h, nodes, filled);
     free(nodes);
     pthread_mutex_unlock(&zsh->mutex);
-    return arr ? arr : reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+    return arr ? arr : reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
 }
 
 /* ── ZRANGEBYSCORE ───────────────────────────────────────── */
-s_replyObject *cmd_zrangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_zrangebyscore(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4) return reply_error(SHM_ERR_ARGC,
         "usage: ZRANGEBYSCORE key min max [REV] [LIMIT offset count]");
@@ -558,7 +566,7 @@ s_replyObject *cmd_zrangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
 
     int64_t cap = 16, filled = 0, skipped = 0;
     uint64_t *nodes = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
-    if (!nodes) { pthread_mutex_unlock(&zsh->mutex); return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM)); }
+    if (!nodes) { pthread_mutex_unlock(&zsh->mutex); return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM)); }
 
     if (!rev) {
         uint64_t cur = core_sn(h, zsh->head_offset)->forward[0];
@@ -572,7 +580,7 @@ s_replyObject *cmd_zrangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
                     if (filled >= cap) {
                         cap *= 2;
                         uint64_t *t = (uint64_t *)realloc(nodes, (size_t)cap * sizeof(uint64_t));
-                        if (!t) { free(nodes); pthread_mutex_unlock(&zsh->mutex); return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM)); }
+                        if (!t) { free(nodes); pthread_mutex_unlock(&zsh->mutex); return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM)); }
                         nodes = t;
                     }
                     nodes[filled++] = cur;
@@ -592,7 +600,7 @@ s_replyObject *cmd_zrangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
                     if (filled >= cap) {
                         cap *= 2;
                         uint64_t *t = (uint64_t *)realloc(nodes, (size_t)cap * sizeof(uint64_t));
-                        if (!t) { free(nodes); pthread_mutex_unlock(&zsh->mutex); return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM)); }
+                        if (!t) { free(nodes); pthread_mutex_unlock(&zsh->mutex); return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM)); }
                         nodes = t;
                     }
                     nodes[filled++] = cur;
@@ -606,11 +614,11 @@ s_replyObject *cmd_zrangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
     s_replyObject *arr = build_zrange_reply(h, nodes, filled);
     free(nodes);
     pthread_mutex_unlock(&zsh->mutex);
-    return arr ? arr : reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+    return arr ? arr : reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
 }
 
 /* ── ZPOPMIN / ZPOPMAX ───────────────────────────────────── */
-static s_replyObject *zpop_impl(ShmHandle *h, string_t *args[],
+static s_replyObject *zpop_impl(MRedisHandle *h, string_t *args[],
                                  uint32_t argc, int from_min)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC,
@@ -626,7 +634,7 @@ static s_replyObject *zpop_impl(ShmHandle *h, string_t *args[],
     if (count > (int64_t)zsh->length) count = (int64_t)zsh->length;
 
     s_replyObject *arr = reply_array((size_t)(count * 2));
-    if (!arr) { pthread_mutex_unlock(&zsh->mutex); return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM)); }
+    if (!arr) { pthread_mutex_unlock(&zsh->mutex); return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM)); }
 
     for (int64_t i = 0; i < count && zsh->length > 0; i++) {
         uint64_t n = from_min
@@ -640,7 +648,7 @@ static s_replyObject *zpop_impl(ShmHandle *h, string_t *args[],
         s_replyObject *sc  = reply_string(sbuf, (size_t)sl);
         if (mem) reply_array_append(arr, mem);
         if (sc)  reply_array_append(arr, sc);
-        uint64_t upd[ZSET_MAX_LEVEL];
+        uint64_t upd[SL_MAX_LEVEL];
         sl_find_update(h, zsh, sn->score,
                        OFF2PTR(h, sn->member_offset), sn->member_len, upd);
         sl_unlink(h, zsh, n, upd);
@@ -650,5 +658,51 @@ static s_replyObject *zpop_impl(ShmHandle *h, string_t *args[],
     pthread_mutex_unlock(&zsh->mutex);
     return arr;
 }
-s_replyObject *cmd_zpopmin(ShmHandle *h, string_t *args[], uint32_t argc) { return zpop_impl(h, args, argc, 1); }
-s_replyObject *cmd_zpopmax(ShmHandle *h, string_t *args[], uint32_t argc) { return zpop_impl(h, args, argc, 0); }
+s_replyObject *cmd_zpopmin(MRedisHandle *h, string_t *args[], uint32_t argc) { return zpop_impl(h, args, argc, 1); }
+s_replyObject *cmd_zpopmax(MRedisHandle *h, string_t *args[], uint32_t argc) { return zpop_impl(h, args, argc, 0); }
+
+/* ── ENTRY_ZSET drop ────────────────────────────────────────
+ *  ① bucket lock → NameEntry 체인에서 제거 → bucket unlock
+ *  ② ZSetHeader.mutex lock → 모든 SkipNode 해제 → unlock
+ *  ③ ZSetHeader 힙 해제
+ *  (cmd_zdrop 과 동일한 순서, lock 역전 없음)
+ * ─────────────────────────────────────────────────────────── */
+int drop_zset(MRedisHandle *h, const void *key, uint32_t klen)
+{
+    uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
+    BucketEntry *bk  = core_get_bucket(h, idx);
+    bucket_lock(h, idx);
+
+    uint64_t prev   = OFFSET_NULL;
+    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_ZSET, &prev);
+    if (ne_off == OFFSET_NULL) {
+        pthread_mutex_unlock(&bk->mutex);
+        return SHM_ERR_NOT_FOUND;
+    }
+    NameEntry  *ne     = (NameEntry  *)OFF2PTR(h, ne_off);
+    uint64_t    zsh_off = ne->data_offset;
+    ZSetHeader *zsh     = (ZSetHeader *)OFF2PTR(h, zsh_off);
+
+    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
+    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
+    nameentry_free(h, ne_off);
+    pthread_mutex_unlock(&bk->mutex);   /* bucket unlock 먼저 */
+
+    /* SkipList 노드 순회 해제 */
+    int rc = pthread_mutex_lock(&zsh->mutex);
+    if (rc == EOWNERDEAD) pthread_mutex_consistent(&zsh->mutex);
+
+    uint64_t cur = core_sn(h, zsh->head_offset)->forward[0];
+    while (cur != OFFSET_NULL) {
+        uint64_t nx = core_sn(h, cur)->forward[0];
+        sl_node_free(h, cur);
+        cur = nx;
+    }
+    heap_free(h, zsh->head_offset);   /* sentinel 해제 */
+    pthread_mutex_unlock(&zsh->mutex);
+    pthread_mutex_destroy(&zsh->mutex);
+    heap_free(h, zsh_off);
+
+    LOG_TRACE("DEL(ZSET): '%.*s'", klen, (const char *)key);
+    return SHM_OK;
+}

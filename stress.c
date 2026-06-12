@@ -3,16 +3,16 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <time.h>
-#include "shm_core.h"
+#include "mredis_core.h"
 
 #define MAX_PROCESSES 16
 #define ITERATIONS 10000
 #define MAX_ALLOC_SIZE 1024
 
-void stress_worker(const char *shm_name) {
-    ShmHandle *h = shm_open_existing(shm_name);
+void stress_worker(const char *mredis_name) {
+    MRedisHandle *h = mredis_open_existing(mredis_name);
     if (!h) {
-        perror("shm_open_existing failed");
+        perror("mredis_open_existing failed");
         exit(1);
     }
 
@@ -44,21 +44,21 @@ void stress_worker(const char *shm_name) {
 		}
 	}
 
-    shm_close(h);
+    mredis_close(h);
     exit(0);
 }
 
 int main(__attribute__((unused)) int argc, __attribute__((unused)) char *argv[]) {
-    const char *shm_name = "/shm_stress_test";
-    uint64_t shm_size = 1024 * 1024 * 1024; // 128MB
-	ShmHandle	*h;
+    const char *mredis_name = "/mredis_stress_test";
+    uint64_t mredis_size = 1024 * 1024 * 1024; // 128MB
+	MRedisHandle	*h;
 	// 1. 초기 SHM 생성 및 힙 초기화
-	shm_destroy(shm_name);
-	h = shm_create(shm_name, shm_size);
+	mredis_destroy(mredis_name);
+	h = mredis_create(mredis_name, mredis_size);
 	if (!h) {
 		return 1;
 	}
-	shm_close(h);
+	mredis_close(h);
 
 	printf("Starting Stress Test with %d processes...\n", MAX_PROCESSES);
 
@@ -66,7 +66,7 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char *argv[])
 	pid_t pids[MAX_PROCESSES];
 	for (int i = 0; i < MAX_PROCESSES; i++) {
 		pids[i] = fork();
-		if (pids[i] == 0) stress_worker(shm_name);
+		if (pids[i] == 0) stress_worker(mredis_name);
 	}
 
 	// 3. 자식 프로세스 대기
@@ -75,9 +75,9 @@ int main(__attribute__((unused)) int argc, __attribute__((unused)) char *argv[])
 	}
 
     // 4. 결과 검증
-    h = shm_open_existing(shm_name);
-    shm_dump_stats(h); // 할당/해제 통계 및 무결성 확인 [cite: 32]
-    shm_close(h);
+    h = mredis_open_existing(mredis_name);
+    mredis_dump_stats(h); // 할당/해제 통계 및 무결성 확인 [cite: 32]
+    mredis_close(h);
 
     printf("Stress Test Completed.\n");
     return 0;

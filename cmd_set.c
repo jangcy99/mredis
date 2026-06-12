@@ -1,12 +1,12 @@
 /*
  * cmd_set.c  –  Redis Set 완전 구현 (SREM, SISMEMBER, SPOP, SRANDMEMBER 포함)
  */
-#define _GNU_SOURCE
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <time.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_set.h"
 
 #define SET_BUCKETS 32
@@ -17,7 +17,7 @@ static inline uint64_t set_alloc_size(void)
 }
 
 /* SetHeader 신규 생성 */
-static uint64_t setheader_new(ShmHandle *h)
+static uint64_t setheader_new(MRedisHandle *h)
 {
     uint64_t off = heap_alloc(h, set_alloc_size());
     if (off == OFFSET_NULL) return OFFSET_NULL;
@@ -25,7 +25,6 @@ static uint64_t setheader_new(ShmHandle *h)
     SetHeader *sh = (SetHeader *)OFF2PTR(h, off);
     sh->member_count = 0;
     sh->n_buckets = SET_BUCKETS;
-    sh->pad = 0;
 
     pthread_mutexattr_t ma;
     pthread_mutexattr_init(&ma);
@@ -42,32 +41,32 @@ static uint64_t setheader_new(ShmHandle *h)
 }
 
 /* Set 가져오기 */
-static SetHeader *set_get(ShmHandle *h, const void *key, uint32_t klen)
+static SetHeader *set_get(MRedisHandle *h, const void *key, uint32_t klen)
 {
-    uint64_t ne = bucket_find(h, shm_hash(key, klen), key, klen, ENTRY_SET, NULL);
+    uint64_t ne = bucket_find(h, mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size, key, klen, ENTRY_SET, NULL);
     if (ne == OFFSET_NULL) return NULL;
     return (SetHeader *)OFF2PTR(h, ((NameEntry*)OFF2PTR(h, ne))->data_offset);
 }
 
 /* Set 가져오기 또는 생성 */
-static SetHeader *set_get_or_create(ShmHandle *h, const void *key, uint32_t klen, int *err_out)
+static SetHeader *set_get_or_create(MRedisHandle *h, const void *key, uint32_t klen, int *err_out)
 {
     SetHeader *sh = set_get(h, key, klen);
     if (sh) { *err_out = SHM_OK; return sh; }
 
-    uint32_t idx = shm_hash(key, klen);
+    uint32_t idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
-    uint64_t ne_off = OFFSET_NULL;
-    int chk = type_check(h, bk, key, klen, ENTRY_SET, &ne_off);
+    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, 0, NULL);
+    if (ne_off != OFFSET_NULL) {
+		NameEntry *ne = (NameEntry *)OFF2PTR(h, ne_off);
+		if (ne->type != ENTRY_SET)	{
+			// already another type key
+			pthread_mutex_unlock(&bk->mutex);
+			return NULL;
+		}
 
-    if (chk == SHM_ERR_KEY_EXISTS) {
-        pthread_mutex_unlock(&bk->mutex);
-        *err_out = SHM_ERR_KEY_EXISTS;
-        return NULL;
-    }
-    if (chk == 0) {
         sh = (SetHeader *)OFF2PTR(h, ((NameEntry*)OFF2PTR(h, ne_off))->data_offset);
         pthread_mutex_unlock(&bk->mutex);
         *err_out = SHM_OK;
@@ -100,38 +99,39 @@ static SetHeader *set_get_or_create(ShmHandle *h, const void *key, uint32_t klen
 /* ============================================================
  *  SCREATE / SDROP
  * ============================================================ */
-s_replyObject *cmd_screate(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_screate(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: SCREATE key");
     const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
 
-    uint32_t idx = shm_hash(key, klen);
+    uint32_t idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
-    uint64_t ne_off = OFFSET_NULL;
-    int chk = type_check(h, bk, key, klen, ENTRY_SET, &ne_off);
-
-    if (chk == SHM_ERR_KEY_EXISTS) {
-        pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_KEY_EXISTS, shm_strerror(SHM_ERR_KEY_EXISTS));
-    }
-    if (chk == 0) {
+    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, 0, NULL);
+    if (ne_off != OFFSET_NULL) {
+		NameEntry *ne = (NameEntry *)OFF2PTR(h, ne_off);
+		if (ne->type != ENTRY_SET)	{
+			// already another type key
+			pthread_mutex_unlock(&bk->mutex);
+			return reply_error(SHM_ERR_KEY_EXISTS, mredis_strerror(SHM_ERR_KEY_EXISTS));
+		}
+		// already key
         pthread_mutex_unlock(&bk->mutex);
         return reply_ok();
-    }
+	}
 
     uint64_t sh_off = setheader_new(h);
     if (sh_off == OFFSET_NULL) {
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+        return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
     }
 
     uint64_t new_ne = nameentry_alloc(h, key, klen, ENTRY_SET, sh_off);
     if (new_ne == OFFSET_NULL) {
         heap_free(h, sh_off);
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+        return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
     }
 
     ((NameEntry *)OFF2PTR(h, new_ne))->next_offset = bk->head_offset;
@@ -140,12 +140,12 @@ s_replyObject *cmd_screate(ShmHandle *h, string_t *args[], uint32_t argc)
     return reply_ok();
 }
 
-s_replyObject *cmd_sdrop(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_sdrop(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: SDROP key");
     const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
 
-    uint32_t idx = shm_hash(key, klen);
+    uint32_t idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -153,7 +153,7 @@ s_replyObject *cmd_sdrop(ShmHandle *h, string_t *args[], uint32_t argc)
     uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_SET, &prev);
     if (ne_off == OFFSET_NULL) {
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_NOT_FOUND, shm_strerror(SHM_ERR_NOT_FOUND));
+        return reply_error(SHM_ERR_NOT_FOUND, mredis_strerror(SHM_ERR_NOT_FOUND));
     }
 
     NameEntry *ne = (NameEntry *)OFF2PTR(h, ne_off);
@@ -191,15 +191,16 @@ s_replyObject *cmd_sdrop(ShmHandle *h, string_t *args[], uint32_t argc)
 /* ============================================================
  *  SADD
  * ============================================================ */
-s_replyObject *cmd_sadd(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_sadd(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3)
         return reply_error(SHM_ERR_ARGC, "usage: SADD key member [member ...]");
 
-    const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
+    const void *key = args[1]->ptr;
+	uint32_t klen = args[1]->len;
     int err;
     SetHeader *sh = set_get_or_create(h, key, klen, &err);
-    if (!sh) return reply_error(err, shm_strerror(err));
+    if (!sh) return reply_error(err, mredis_strerror(err));
 
     int rc = pthread_mutex_lock(&sh->mutex);
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&sh->mutex);
@@ -212,7 +213,7 @@ s_replyObject *cmd_sadd(ShmHandle *h, string_t *args[], uint32_t argc)
         uint32_t mlen = args[i]->len;
         if (mlen == 0) continue;
 
-        uint32_t bi = shm_field_hash(member, mlen, sh->n_buckets);
+        uint32_t bi = mredis_field_hash(member, mlen, sh->n_buckets);
         uint64_t cur = buckets[bi];
         int exists = 0;
 
@@ -251,7 +252,7 @@ s_replyObject *cmd_sadd(ShmHandle *h, string_t *args[], uint32_t argc)
 /* ============================================================
  *  SISMEMBER
  * ============================================================ */
-s_replyObject *cmd_sismember(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_sismember(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3)
         return reply_error(SHM_ERR_ARGC, "usage: SISMEMBER key member");
@@ -266,7 +267,7 @@ s_replyObject *cmd_sismember(ShmHandle *h, string_t *args[], uint32_t argc)
     if (rc == EOWNERDEAD) pthread_mutex_consistent(&sh->mutex);
 
     uint64_t *buckets = (uint64_t*)(sh + 1);
-    uint32_t bi = shm_field_hash(member, mlen, sh->n_buckets);
+    uint32_t bi = mredis_field_hash(member, mlen, sh->n_buckets);
     uint64_t cur = buckets[bi];
     int found = 0;
 
@@ -286,21 +287,21 @@ s_replyObject *cmd_sismember(ShmHandle *h, string_t *args[], uint32_t argc)
 /* ============================================================
  *  SCARD, SMEMBERS
  * ============================================================ */
-s_replyObject *cmd_scard(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_scard(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: SCARD key");
     SetHeader *sh = set_get(h, args[1]->ptr, args[1]->len);
     return reply_integer(sh ? (int64_t)sh->member_count : 0);
 }
 
-s_replyObject *cmd_smembers(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_smembers(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: SMEMBERS key");
     SetHeader *sh = set_get(h, args[1]->ptr, args[1]->len);
     if (!sh) return reply_array(0);
 
     s_replyObject *arr = reply_array(sh->member_count);
-    if (!arr) return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+    if (!arr) return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
 
     uint64_t *buckets = (uint64_t*)(sh + 1);
     for (uint32_t i = 0; i < sh->n_buckets; i++) {
@@ -318,7 +319,7 @@ s_replyObject *cmd_smembers(ShmHandle *h, string_t *args[], uint32_t argc)
 /* ============================================================
  *  SREM - robust 버전
  * ============================================================ */
-s_replyObject *cmd_srem(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_srem(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3)
         return reply_error(SHM_ERR_ARGC, "usage: SREM key member [member ...]");
@@ -338,7 +339,7 @@ s_replyObject *cmd_srem(ShmHandle *h, string_t *args[], uint32_t argc)
         uint32_t mlen = args[i]->len;
         if (mlen == 0) continue;
 
-        uint32_t bi = shm_field_hash(member, mlen, sh->n_buckets);
+        uint32_t bi = mredis_field_hash(member, mlen, sh->n_buckets);
         uint64_t prev = OFFSET_NULL;
         uint64_t cur = buckets[bi];
 
@@ -371,7 +372,7 @@ s_replyObject *cmd_srem(ShmHandle *h, string_t *args[], uint32_t argc)
 /* ============================================================
  *  SPOP - robust 버전
  * ============================================================ */
-s_replyObject *cmd_spop(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_spop(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2)
         return reply_error(SHM_ERR_ARGC, "usage: SPOP key [count]");
@@ -394,7 +395,7 @@ s_replyObject *cmd_spop(ShmHandle *h, string_t *args[], uint32_t argc)
     s_replyObject *arr = reply_array(count);
     if (!arr) {
         pthread_mutex_unlock(&sh->mutex);
-        return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+        return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
     }
 
     uint64_t *buckets = (uint64_t*)(sh + 1);
@@ -442,7 +443,7 @@ s_replyObject *cmd_spop(ShmHandle *h, string_t *args[], uint32_t argc)
     return arr;
 }
 
-s_replyObject *cmd_srandmember(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_srandmember(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2)
         return reply_error(SHM_ERR_ARGC, "usage: SRANDMEMBER key [count]");
@@ -485,7 +486,7 @@ s_replyObject *cmd_srandmember(ShmHandle *h, string_t *args[], uint32_t argc)
         s_replyObject *arr = reply_array(count);
         if (!arr) {
             pthread_mutex_unlock(&sh->mutex);
-            return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+            return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
         }
 
         uint64_t *buckets = (uint64_t*)(sh + 1);

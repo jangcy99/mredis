@@ -26,8 +26,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 
 /* ── 매직 / 버전 ────────────────────────────────────────── */
 #define RDB_MAGIC       "MREDIS"
@@ -85,19 +85,19 @@ void rdb_close(RdbHandle *rdb);
  *   tmp 파일에 쓰고 완료 후 atomic rename.
  *   반환: SHM_OK / SHM_ERR
  */
-int rdb_save(RdbHandle *rdb, ShmHandle *shm);
+int rdb_save(RdbHandle *rdb, MRedisHandle *shm);
 
 /*
  * rdb_load  –  RDB 파일 → SHM 적재 (서버 시작 시).
  *   반환: 적재된 키 수 (실패 시 음수)
  */
-int64_t rdb_load(RdbHandle *rdb, ShmHandle *shm);
+int64_t rdb_load(RdbHandle *rdb, MRedisHandle *shm);
 
 /*
  * rdb_save_bg  –  BGSAVE: fork() → 자식이 rdb_save 수행.
  *   반환: SHM_OK (fork 성공) / SHM_ERR
  */
-int rdb_save_bg(RdbHandle *rdb, ShmHandle *shm);
+int rdb_save_bg(RdbHandle *rdb, MRedisHandle *shm);
 
 /*
  * rdb_save_check  –  BGSAVE 자식 완료 여부 확인 (non-blocking).

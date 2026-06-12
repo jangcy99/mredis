@@ -11,17 +11,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fnmatch.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_keys.h"
 
-s_replyObject *cmd_keys(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_keys(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2)
         return reply_error(SHM_ERR_ARGC, "usage: KEYS pattern");
 
     const char *pattern = args[1]->ptr;
-    ShmHeader  *s       = (ShmHeader *)h->base;
+    MRedisHeader  *s       = (MRedisHeader *)h->base;
     s_replyObject *arr  = reply_array(0);
     if (!arr) return reply_error(SHM_ERR_NOMEM, "메모리 부족");
 

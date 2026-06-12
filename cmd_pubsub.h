@@ -10,8 +10,8 @@
  *    - 시그널: SIGRTMIN+15, sigqueue(sival_ptr = entry offset)
  *    - 수신: signalfd + pubsub_handle_event()
  */
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 
 #define ENTRY_PUBSUB  0x7u
 #define SIG_PUBSUB    (SIGRTMIN + 15u)
@@ -42,23 +42,23 @@ typedef void (*PubSubCallback)(const char *channel, uint32_t clen,
                                void *user_data);
 
 /* ── 커맨드 ─────────────────────────────────────────────── */
-s_replyObject *cmd_publish    (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_subscribe  (ShmHandle *h, string_t *args[], uint32_t argc);
-s_replyObject *cmd_unsubscribe(ShmHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_publish    (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_subscribe  (MRedisHandle *h, string_t *args[], uint32_t argc);
+s_replyObject *cmd_unsubscribe(MRedisHandle *h, string_t *args[], uint32_t argc);
 
 /* ── 이벤트 수신 (signalfd read 후 호출) ─────────────────── */
-s_replyObject *pubsub_handle_event(ShmHandle *h, int signalfd_fd);
+s_replyObject *pubsub_handle_event(MRedisHandle *h, int signalfd_fd);
 
 /* ── 유틸 ───────────────────────────────────────────────── */
 void pubsub_set_callback(PubSubCallback cb, void *user_data);
 
 /* 채널 헤더 검색/생성 (flag=0:검색만, flag=1:없으면생성) */
-uint64_t find_or_create_channel_header(ShmHandle *h, const char *channel,
+uint64_t find_or_create_channel_header(MRedisHandle *h, const char *channel,
                                         uint32_t clen, int flag);
-void pubsub_cleanup(ShmHandle *h);
+void pubsub_cleanup(MRedisHandle *h);
 
 /* stub – resp_server 링크 호환 */
-static inline int  pubsub_start_listener(ShmHandle *h) { (void)h; return 0; }
+static inline int  pubsub_start_listener(MRedisHandle *h) { (void)h; return 0; }
 static inline void pubsub_stop_listener(void) {}
 
 #endif /* CMD_PUBSUB_H */

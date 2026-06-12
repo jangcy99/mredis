@@ -2,7 +2,7 @@
 #  mredis Makefile
 # ═══════════════════════════════════════════════════════
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE
+CFLAGS  = -Wall -Wextra -O2 -fPIC -g -std=c11 -D_GNU_SOURCE -I$(JAVA_HOME)/include -I$(JAVA_HOME)/include/linux
 LDFLAGS = -lrt -lpthread -lm
 
 CI_DEFS  = -DHASH_TABLE_SIZE=0x10000ULL \
@@ -12,18 +12,34 @@ CI_DEFS  = -DHASH_TABLE_SIZE=0x10000ULL \
 PROD_DEFS = -DHASH_FIELD_BUCKETS=16U \
             -DSHM_DEBUG_LEVEL=1
 
-HDRS = shm_types.h shm_core.h \
+HDRS = mredis_types.h mredis_core.h \
        cmd_kv.h cmd_zset.h cmd_hash.h cmd_keys.h \
-       cmd_del.h cmd_bset.h cmd_cset.h cmd_dispatch.h
+       cmd_del.h cmd_bset.h cmd_cset.h cmd_dispatch.h skiplist.h cmd_set.h
 
-CORE_SRCS = shm_core.c siphash.c
+CORE_SRCS = mredis_core.c siphash.c skiplist.c
 CMD_SRCS  = cmd_kv.c cmd_zset.c cmd_hash.c cmd_keys.c \
-            cmd_del.c cmd_bset.c cmd_cset.c cmd_dispatch.c cmd_pubsub.c
+            cmd_del.c cmd_bset.c cmd_cset.c cmd_dispatch.c cmd_pubsub.c MRedisNative.c \
+			cmd_set.c
 ALL_SRCS  = $(CORE_SRCS) $(CMD_SRCS)
+ALL_OBJS  = $(ALL_SRCS:.c=.o)
 
 .PHONY: all ci test clean bset cset pubsub help
 
-all: ci
+all: static shared ci
+
+%.o:%.c
+	$(CC) $(CFLAGS) $(CI_DEFS) -c -o $@ $<
+
+static: $(ALL_OBJS)
+	ar ruv libmredis.a $(ALL_OBJS)
+
+shared:	libmredis.so.1
+
+libmredis.so.1:	$(ALL_OBJS)
+	$(CC) -shared -Wl,-soname,libmredis.so.1 -o $@ $^ $(LDFLAGS)
+	ln -sf libmredis.so.1 libmredis.so
+	ln -sf libmredis.so.1 libmredis.so.1.1
+
 
 # ── 전체 통합 테스트 ─────────────────────────────────────
 ci: test_all_ci
@@ -62,9 +78,10 @@ resp_server: $(ALL_SRCS) resp_server.c $(HDRS)
 # ── 정리 ────────────────────────────────────────────────
 clean:
 	rm -f test_all_ci test_bset test_pubsub resp_server *.o
-	-rm -f /dev/shm/shm_mredis_all_test \
-	        /dev/shm/shm_bset_test \
-	        /dev/shm/shm_pubsub_test 2>/dev/null || true
+	-rm -f /dev/shm/mredis_mredis_all_test \
+	        /dev/shm/mredis_bset_test \
+	        /dev/shm/mredis_pubsub_test 2>/dev/null || true
+	-rm 0f *.so *.a
 	@echo "정리 완료"
 
 help:

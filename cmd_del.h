@@ -18,8 +18,8 @@
  * │    2. 해당 drop 함수를 DelDropFn 시그니처에 맞게 래핑        │
  * └──────────────────────────────────────────────────────────────┘
  */
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 
 /*
  * DEL 라우팅 테이블 엔트리.
@@ -27,7 +27,7 @@
  *   key/klen 은 삭제 대상 키.
  *   반환: SHM_OK(=0) 성공, 음수 실패
  */
-typedef int (*DelDropFn)(ShmHandle *h,
+typedef int (*DelDropFn)(MRedisHandle *h,
                           const void *key, uint32_t klen);
 
 typedef struct {
@@ -37,7 +37,8 @@ typedef struct {
 } DelRouteEntry;
 
 /* 범용 DEL – 모든 타입 삭제 */
-s_replyObject *cmd_del(ShmHandle *h, string_t *args[], uint32_t argc);
+int	register_cmd_del (const uint32_t entry_type, const char *type_name, DelDropFn func);
+s_replyObject *cmd_del(MRedisHandle *h, string_t *args[], uint32_t argc);
 
 /* 라우팅 테이블 직접 접근 (테스트/확장용) */
 const DelRouteEntry *del_route_table_get(size_t *out_count);

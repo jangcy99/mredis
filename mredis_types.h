@@ -2,12 +2,12 @@
 #define SHM_TYPES_H
 
 /*
- * shm_types.h  –  공통 타입 정의 (v5)
+ * mredis_types.h  –  공통 타입 정의 (v5)
  *
  *  ┌──────────────────────────────────────────────────────────────┐
  *  │  모든 cmd_*() 함수의 반환 타입 = s_replyObject *             │
  *  │  모든 cmd_*() 함수의 시그니처:                               │
- *  │    s_replyObject *cmd_XXX(ShmHandle *h,                      │
+ *  │    s_replyObject *cmd_XXX(MRedisHandle *h,                      │
  *  │                           string_t   *args[],                │
  *  │                           uint32_t    argc);                 │
  *  │                                                              │
@@ -36,7 +36,7 @@
 /* ============================================================
  *  컴파일 타임 파라미터
  * ============================================================ */
-#define SHM_DEFAULT_NAME    "/shm_hashtable"
+#define SHM_DEFAULT_NAME    "/mredis_hashtable"
 
 #ifndef HASH_TABLE_SIZE
 #define HASH_TABLE_SIZE     0x1000000ULL    /* 16M 버킷 (4GB 운영) */
@@ -77,28 +77,15 @@
 #define SHM_DEBUG_LEVEL DBG_INFO
 #endif
 
-/* ============================================================
- *  ZSet 파라미터
- * ============================================================ */
-#define ZSET_MAX_LEVEL  32
-#define ZSET_P          0.25
-
-#define ZADD_NONE   0x00
-#define ZADD_NX     0x01
-#define ZADD_XX     0x02
-#define ZADD_GT     0x04
-#define ZADD_LT     0x08
-#define ZADD_CH     0x10
-
-#define ZRANGE_ASC  0
-#define ZRANGE_DESC 1
 
 /* NameEntry 타입 */
 #define ENTRY_KV    1u
 #define ENTRY_ZSET  2u
 #define ENTRY_HASH  3u
-#define ENTRY_BSET  5u
-#define ENTRY_CSET  6u
+#define ENTRY_BSET  4u
+#define ENTRY_CSET  5u
+#define	ENTRY_SET	6u
+
 
 /* ============================================================
  *  string_t  –  길이 포함 바이트열
@@ -297,8 +284,8 @@ static inline void reply_print(const s_replyObject *r, int indent)
 #define HEAP_BLOCK_MAGIC  0xDEADBEEFU
 
 typedef struct {
-	uint64_t head_offset;
 	pthread_mutex_t mutex;
+	uint64_t head_offset;
 } BucketEntry;
 
 typedef struct {
@@ -308,41 +295,6 @@ typedef struct {
 	uint32_t type;
 	uint64_t data_offset;
 } NameEntry;
-
-typedef struct {
-	uint64_t val_offset;
-	uint32_t val_len;
-	uint32_t pad;
-} KVNode;
-
-typedef struct {
-    double   score;
-    uint64_t member_offset; uint32_t member_len; uint32_t level_count;
-    uint64_t backward_offset;
-    uint64_t forward[ZSET_MAX_LEVEL];
-} SkipNode;
-
-typedef struct {
-    uint64_t head_offset; uint64_t tail_offset; uint64_t length;
-    uint32_t cur_level;   uint32_t pad;
-    pthread_mutex_t mutex;
-} ZSetHeader;
-
-typedef struct {
-    uint64_t next_offset;
-	uint64_t field_offset;
-    uint64_t val_offset;
-	uint32_t field_len;
-	uint32_t val_len;
-} FieldEntry;
-
-typedef struct {
-    uint64_t field_count;
-	uint32_t n_buckets;
-	uint32_t pad;
-    pthread_mutex_t mutex;
-    /* 뒤이어 uint64_t field_buckets[n_buckets] */
-} HashHeader;
 
 #define BIN_COUNT          32
 
@@ -362,29 +314,29 @@ typedef struct BlockFooter {
 
 
 typedef struct {
+    pthread_mutex_t heap_mutex;
     uint64_t heap_start;
     uint64_t heap_size;
     uint64_t free_bins[BIN_COUNT];        /* ← Best-Fit Bin 배열 (free_list 대신) */
-    pthread_mutex_t heap_mutex;
     uint64_t total_alloc;
     uint64_t total_free;
     uint64_t used_bytes;
 } HeapHeader;
 
 typedef struct {
-    uint64_t shm_size;
+    uint64_t mredis_size;
 	uint64_t bucket_offset;
 	uint64_t heap_header_offset;
     uint32_t initialized;
 	uint32_t version;
 	uint32_t hash_table_size;
 	uint32_t pad;
-} ShmHeader;
+} MRedisHeader;
 
 typedef struct {
 	void *base;
 	int fd;
 	uint64_t size;
-} ShmHandle;
+} MRedisHandle;
 
 #endif /* SHM_TYPES_H */

@@ -32,8 +32,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
+#include "cmd_kv.h"
 #include "cmd_zset.h"
 #include "cmd_hash.h"
 #include "cmd_del.h"
@@ -55,236 +56,17 @@
  *   기존 파일 무수정 원칙을 지키기 위해 래퍼 방식을 사용한다.)
  * ============================================================ */
 
-/* ── ENTRY_KV drop ──────────────────────────────────────────
- *  bucket 을 lock 한 상태에서 NameEntry 를 bucket chain 에서
- *  제거하고 KVNode + value 를 힙에서 해제한다.
- * ─────────────────────────────────────────────────────────── */
-static int drop_kv(ShmHandle *h, const void *key, uint32_t klen)
-{
-    uint32_t     idx  = shm_hash(key, klen);
-    BucketEntry *bk   = core_get_bucket(h, idx);
-    bucket_lock(h, idx);
-
-    uint64_t prev   = OFFSET_NULL;
-    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_KV, &prev);
-    if (ne_off == OFFSET_NULL) {
-        pthread_mutex_unlock(&bk->mutex);
-        return SHM_ERR_NOT_FOUND;
-    }
-    NameEntry *ne = (NameEntry *)OFF2PTR(h, ne_off);
-    KVNode    *kv = (KVNode    *)OFF2PTR(h, ne->data_offset);
-
-    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
-    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
-
-    heap_free(h, kv->val_offset);
-    heap_free(h, ne->data_offset);
-    nameentry_free(h, ne_off);
-    pthread_mutex_unlock(&bk->mutex);
-
-    LOG_TRACE("DEL(KV): '%.*s'", klen, (const char *)key);
-    return SHM_OK;
-}
-
-/* ── ENTRY_ZSET drop ────────────────────────────────────────
- *  ① bucket lock → NameEntry 체인에서 제거 → bucket unlock
- *  ② ZSetHeader.mutex lock → 모든 SkipNode 해제 → unlock
- *  ③ ZSetHeader 힙 해제
- *  (cmd_zdrop 과 동일한 순서, lock 역전 없음)
- * ─────────────────────────────────────────────────────────── */
-static int drop_zset(ShmHandle *h, const void *key, uint32_t klen)
-{
-    uint32_t     idx = shm_hash(key, klen);
-    BucketEntry *bk  = core_get_bucket(h, idx);
-    bucket_lock(h, idx);
-
-    uint64_t prev   = OFFSET_NULL;
-    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_ZSET, &prev);
-    if (ne_off == OFFSET_NULL) {
-        pthread_mutex_unlock(&bk->mutex);
-        return SHM_ERR_NOT_FOUND;
-    }
-    NameEntry  *ne     = (NameEntry  *)OFF2PTR(h, ne_off);
-    uint64_t    zsh_off = ne->data_offset;
-    ZSetHeader *zsh     = (ZSetHeader *)OFF2PTR(h, zsh_off);
-
-    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
-    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
-    nameentry_free(h, ne_off);
-    pthread_mutex_unlock(&bk->mutex);   /* bucket unlock 먼저 */
-
-    /* SkipList 노드 순회 해제 */
-    int rc = pthread_mutex_lock(&zsh->mutex);
-    if (rc == EOWNERDEAD) pthread_mutex_consistent(&zsh->mutex);
-
-    uint64_t cur = core_sn(h, zsh->head_offset)->forward[0];
-    while (cur != OFFSET_NULL) {
-        uint64_t nx = core_sn(h, cur)->forward[0];
-        sl_node_free(h, cur);
-        cur = nx;
-    }
-    heap_free(h, zsh->head_offset);   /* sentinel 해제 */
-    pthread_mutex_unlock(&zsh->mutex);
-    pthread_mutex_destroy(&zsh->mutex);
-    heap_free(h, zsh_off);
-
-    LOG_TRACE("DEL(ZSET): '%.*s'", klen, (const char *)key);
-    return SHM_OK;
-}
-
-/* ── ENTRY_HASH drop ────────────────────────────────────────
- *  ① bucket lock → NameEntry 제거 → bucket unlock
- *  ② HashHeader.mutex lock → 모든 FieldEntry 해제 → unlock
- *  ③ HashHeader 힙 해제
- *  (cmd_hdrop 과 동일한 순서)
- * ─────────────────────────────────────────────────────────── */
-
-/* hash_drop_fields_locked 는 cmd_hash.c 내부 static 이므로
- * 동일 로직을 여기서 인라인으로 수행한다.              */
-static void drop_hash_fields(ShmHandle *h, HashHeader *hh)
-{
-    uint64_t *bkts = hh_field_buckets(hh);
-    for (uint32_t i = 0; i < hh->n_buckets; i++) {
-        uint64_t cur = bkts[i];
-        while (cur != OFFSET_NULL) {
-            FieldEntry *fe = (FieldEntry *)OFF2PTR(h, cur);
-            uint64_t    nxt = fe->next_offset;
-            heap_free(h, fe->field_offset);
-            heap_free(h, fe->val_offset);
-            heap_free(h, cur);
-            cur = nxt;
-        }
-        bkts[i] = OFFSET_NULL;
-    }
-    hh->field_count = 0;
-}
-
-static int drop_hash(ShmHandle *h, const void *key, uint32_t klen)
-{
-    uint32_t     idx = shm_hash(key, klen);
-    BucketEntry *bk  = core_get_bucket(h, idx);
-    bucket_lock(h, idx);
-
-    uint64_t prev   = OFFSET_NULL;
-    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_HASH, &prev);
-    if (ne_off == OFFSET_NULL) {
-        pthread_mutex_unlock(&bk->mutex);
-        return SHM_ERR_NOT_FOUND;
-    }
-    NameEntry  *ne    = (NameEntry  *)OFF2PTR(h, ne_off);
-    uint64_t    hh_off = ne->data_offset;
-    HashHeader *hh     = (HashHeader *)OFF2PTR(h, hh_off);
-
-    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
-    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
-    nameentry_free(h, ne_off);
-    pthread_mutex_unlock(&bk->mutex);   /* bucket unlock 먼저 */
-
-    int rc = pthread_mutex_lock(&hh->mutex);
-    if (rc == EOWNERDEAD) pthread_mutex_consistent(&hh->mutex);
-    drop_hash_fields(h, hh);
-    pthread_mutex_unlock(&hh->mutex);
-    pthread_mutex_destroy(&hh->mutex);
-    heap_free(h, hh_off);
-
-    LOG_TRACE("DEL(HASH): '%.*s'", klen, (const char *)key);
-    return SHM_OK;
-}
-
-
-/* ── ENTRY_BSET drop ────────────────────────────────────────
- *  ① bucket lock → NameEntry 제거 → bucket unlock
- *  ② BSetHeader.mutex lock → 모든 BSetEntry value 해제 → unlock
- *  ③ BSetHeader + 배열 힙 해제
- * ─────────────────────────────────────────────────────────── */
-static int drop_bset(ShmHandle *h, const void *key, uint32_t klen)
-{
-    uint32_t     idx = shm_hash(key, klen);
-    BucketEntry *bk  = core_get_bucket(h, idx);
-    bucket_lock(h, idx);
-
-    uint64_t prev   = OFFSET_NULL;
-    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_BSET, &prev);
-    if (ne_off == OFFSET_NULL) {
-        pthread_mutex_unlock(&bk->mutex);
-        return SHM_ERR_NOT_FOUND;
-    }
-    NameEntry  *ne    = (NameEntry *)OFF2PTR(h, ne_off);
-    uint64_t    bh_off = ne->data_offset;
-    BSetHeader *bh     = (BSetHeader *)OFF2PTR(h, bh_off);
-
-    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
-    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
-    nameentry_free(h, ne_off);
-    pthread_mutex_unlock(&bk->mutex);
-
-    pthread_rwlock_wrlock(&bh->rwlock);
-    BSetEntry *arr = (BSetEntry *)OFF2PTR(h, bh->array_offset);
-    for (uint64_t i = 0; i < bh->count; i++)
-        heap_free(h, arr[i].offset);
-    heap_free(h, bh->array_offset);
-    pthread_rwlock_unlock(&bh->rwlock);
-    pthread_rwlock_destroy(&bh->rwlock);
-    heap_free(h, bh_off);
-
-    LOG_TRACE("DEL(BSET): '%.*s'", klen, (const char *)key);
-    return SHM_OK;
-}
-
-
-/* ── ENTRY_CSET drop ────────────────────────────────────────
- *  청크 체인 전체 해제 (삭제 비트 무시, 모든 live offset heap_free)
- * ─────────────────────────────────────────────────────────── */
-static int drop_cset(ShmHandle *h, const void *key, uint32_t klen)
-{
-    uint32_t     idx = shm_hash(key, klen);
-    BucketEntry *bk  = core_get_bucket(h, idx);
-    bucket_lock(h, idx);
-
-    uint64_t prev   = OFFSET_NULL;
-    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_CSET, &prev);
-    if (ne_off == OFFSET_NULL) {
-        pthread_mutex_unlock(&bk->mutex);
-        return SHM_ERR_NOT_FOUND;
-    }
-    NameEntry  *ne    = (NameEntry *)OFF2PTR(h, ne_off);
-    uint64_t    bh_off = ne->data_offset;
-    CSetHeader *bh     = (CSetHeader *)OFF2PTR(h, bh_off);
-
-    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
-    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
-    nameentry_free(h, ne_off);
-    pthread_mutex_unlock(&bk->mutex);
-
-    pthread_rwlock_wrlock(&bh->rwlock);
-    uint64_t cur_off = bh->chunk_head;
-    while (cur_off != OFFSET_NULL) {
-        CSetChunk *c = (CSetChunk *)OFF2PTR(h, cur_off);
-        uint64_t   nxt = c->next_off;
-        for (uint32_t i = 0; i < c->count; i++)
-            if (!CS_DEL_GET(c,i) && c->entries[i].offset != OFFSET_NULL)
-                heap_free(h, c->entries[i].offset);
-        heap_free(h, cur_off);
-        cur_off = nxt;
-    }
-    pthread_rwlock_unlock(&bh->rwlock);
-    pthread_rwlock_destroy(&bh->rwlock);
-    heap_free(h, bh_off);
-    LOG_TRACE("DEL(CSET): '%.*s'", klen, (const char *)key);
-    return SHM_OK;
-}
-
 /* ============================================================
  *  §2  DEL 라우팅 테이블
  *
  *  새 타입 추가 시 이 테이블에 한 줄만 추가하면 된다.
  * ============================================================ */
-static const DelRouteEntry g_del_route[] = {
+static DelRouteEntry g_del_route[64] = {
     { ENTRY_KV,   "KV",   drop_kv   },
-    { ENTRY_ZSET, "ZSET", drop_zset },
     { ENTRY_HASH, "HASH", drop_hash },
     { ENTRY_BSET, "BSET", drop_bset },
     { ENTRY_CSET, "CSET", drop_cset },
+    { ENTRY_ZSET, "ZSET", drop_zset },
     /*
      * 향후 추가 예시:
      * { ENTRY_ZHSET, "ZHSET", drop_zhset },
@@ -293,13 +75,20 @@ static const DelRouteEntry g_del_route[] = {
      */
 };
 
-static const size_t g_del_route_count =
-    sizeof(g_del_route) / sizeof(g_del_route[0]);
+static size_t g_del_route_count = 5;
 
 const DelRouteEntry *del_route_table_get(size_t *out_count)
 {
     if (out_count) *out_count = g_del_route_count;
     return g_del_route;
+}
+
+int	register_cmd_del (const uint32_t entry_type, const char *type_name, DelDropFn func)	{
+	g_del_route[g_del_route_count].entry_type = entry_type;
+	g_del_route[g_del_route_count].type_name = strdup (type_name);
+	g_del_route[g_del_route_count].drop_fn = func;
+	g_del_route_count ++;
+	return 0;
 }
 
 /* ============================================================
@@ -319,7 +108,7 @@ const DelRouteEntry *del_route_table_get(size_t *out_count)
  *    두 번째 bucket_find 가 OFFSET_NULL 을 반환해 안전하게 종료.
  *  - 타입이 바뀌는 일은 없다 (같은 key 에 다른 타입 삽입 불가).
  * ============================================================ */
-s_replyObject *cmd_del(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_del(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2)
         return reply_error(SHM_ERR_ARGC, "usage: DEL key [key …]");
@@ -332,7 +121,7 @@ s_replyObject *cmd_del(ShmHandle *h, string_t *args[], uint32_t argc)
         if (klen == 0) continue;
 
         /* ── step 1: type 조회 (짧은 lock) ─────────────────── */
-        uint32_t     idx  = shm_hash(key, klen);
+        uint32_t     idx  = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
         BucketEntry *bk   = core_get_bucket(h, idx);
         bucket_lock(h, idx);
         uint64_t ne_off = bucket_find_locked(h, bk, key, klen, 0, NULL);

@@ -28,8 +28,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_bset.h"
 
 /* ============================================================
@@ -62,7 +62,7 @@ static inline void bs_unlock(BSetHeader *bh)
 /* ============================================================
  *  §2  BSetEntry 배열 접근자 / 이진 탐색
  * ============================================================ */
-static inline BSetEntry *bs_arr(ShmHandle *h, BSetHeader *bh)
+static inline BSetEntry *bs_arr(MRedisHandle *h, BSetHeader *bh)
 {
     return (BSetEntry *)OFF2PTR(h, bh->array_offset);
 }
@@ -104,7 +104,7 @@ static uint64_t bs_upper_bound(const BSetEntry *arr, uint64_t n,
 /* ============================================================
  *  §3  BSetHeader 생명주기
  * ============================================================ */
-static int bset_type_check(ShmHandle *h, BucketEntry *bk,
+static int bset_type_check(MRedisHandle *h, BucketEntry *bk,
                              const void *key, uint32_t klen,
                              uint64_t *out_ne)
 {
@@ -116,7 +116,7 @@ static int bset_type_check(ShmHandle *h, BucketEntry *bk,
     return 0;
 }
 
-static int bset_create_locked(ShmHandle *h, BucketEntry *bk,
+static int bset_create_locked(MRedisHandle *h, BucketEntry *bk,
                                 const void *key, uint32_t klen)
 {
     uint64_t bh_off = heap_alloc(h, sizeof(BSetHeader));
@@ -149,14 +149,14 @@ static int bset_create_locked(ShmHandle *h, BucketEntry *bk,
     return SHM_OK;
 }
 
-static BSetHeader *bset_get_or_create(ShmHandle *h,
+static BSetHeader *bset_get_or_create(MRedisHandle *h,
                                        const void *key, uint32_t klen,
                                        int *err_out)
 {
     BSetHeader *bh = core_bset_get(h, key, klen);
     if (bh) { if (err_out) *err_out = SHM_OK; return bh; }
 
-    uint32_t     idx = shm_hash(key, klen);
+    uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk  = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -181,9 +181,9 @@ static BSetHeader *bset_get_or_create(ShmHandle *h,
     return core_bset_get(h, key, klen);
 }
 
-BSetHeader *core_bset_get(ShmHandle *h, const void *key, uint32_t klen)
+BSetHeader *core_bset_get(MRedisHandle *h, const void *key, uint32_t klen)
 {
-    uint64_t ne = bucket_find(h, shm_hash(key, klen),
+    uint64_t ne = bucket_find(h, mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size,
                                key, klen, ENTRY_BSET, NULL);
     if (ne == OFFSET_NULL) return NULL;
     return (BSetHeader *)OFF2PTR(h,
@@ -193,7 +193,7 @@ BSetHeader *core_bset_get(ShmHandle *h, const void *key, uint32_t klen)
 /* ============================================================
  *  §4  배열 확장 / 축소 (wrlock 구간 내 호출)
  * ============================================================ */
-static int bs_grow(ShmHandle *h, BSetHeader *bh)
+static int bs_grow(MRedisHandle *h, BSetHeader *bh)
 {
     uint64_t new_cap = bh->capacity + BSET_CHUNK;
     uint64_t new_off = heap_alloc(h, new_cap * sizeof(BSetEntry));
@@ -211,7 +211,7 @@ static int bs_grow(ShmHandle *h, BSetHeader *bh)
     return SHM_OK;
 }
 
-static void bs_shrink_if_needed(ShmHandle *h, BSetHeader *bh)
+static void bs_shrink_if_needed(MRedisHandle *h, BSetHeader *bh)
 {
     if (bh->capacity <= BSET_CHUNK) return;
     if (bh->count >= bh->capacity / 2) return;
@@ -244,7 +244,7 @@ static void bs_shrink_if_needed(ShmHandle *h, BSetHeader *bh)
  *
  *  반환: 1=신규, 0=갱신, 음수=에러
  * ============================================================ */
-static int bs_insert_one(ShmHandle *h, BSetHeader *bh,
+static int bs_insert_one(MRedisHandle *h, BSetHeader *bh,
                           uint64_t score,
                           const void *val, uint32_t vlen)
 {
@@ -318,7 +318,7 @@ static int bs_insert_one(ShmHandle *h, BSetHeader *bh,
 /* ============================================================
  *  §6  응답 배열 빌더 (rdlock / wrlock 구간 모두 사용)
  * ============================================================ */
-static int bs_append_pair(ShmHandle *h, s_replyObject *arr,
+static int bs_append_pair(MRedisHandle *h, s_replyObject *arr,
                            const BSetEntry *e)
 {
     char sbuf[24];
@@ -338,7 +338,7 @@ static int bs_append_pair(ShmHandle *h, s_replyObject *arr,
  *  §7  BSET  key score value [score value …]
  *  [wrlock] 신규=1, 갱신=0 per pair
  * ============================================================ */
-s_replyObject *cmd_bset(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_bset(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4 || (argc - 2) % 2 != 0)
         return reply_error(SHM_ERR_ARGC,
@@ -349,7 +349,7 @@ s_replyObject *cmd_bset(ShmHandle *h, string_t *args[], uint32_t argc)
 
     /* 타입 충돌 사전 검사 (bucket lock → unlock) */
     {
-        uint32_t     idx = shm_hash(key, klen);
+        uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
         BucketEntry *bk  = core_get_bucket(h, idx);
         bucket_lock(h, idx);
         uint64_t any = bucket_find_locked(h, bk, key, klen, 0, NULL);
@@ -357,14 +357,14 @@ s_replyObject *cmd_bset(ShmHandle *h, string_t *args[], uint32_t argc)
             ((NameEntry *)OFF2PTR(h, any))->type != ENTRY_BSET) {
             pthread_mutex_unlock(&bk->mutex);
             return reply_error(SHM_ERR_KEY_EXISTS,
-                               shm_strerror(SHM_ERR_KEY_EXISTS));
+                               mredis_strerror(SHM_ERR_KEY_EXISTS));
         }
         pthread_mutex_unlock(&bk->mutex);
     }
 
     int err = SHM_OK;
     BSetHeader *bh = bset_get_or_create(h, key, klen, &err);
-    if (!bh) return reply_error(err, shm_strerror(err));
+    if (!bh) return reply_error(err, mredis_strerror(err));
 
     /* wrlock: 쓰기 배타 */
     bs_wrlock(bh);
@@ -379,7 +379,7 @@ s_replyObject *cmd_bset(ShmHandle *h, string_t *args[], uint32_t argc)
         }
         int r = bs_insert_one(h, bh, score,
                               args[i+1]->ptr, args[i+1]->len);
-        if (r < 0) { bs_unlock(bh); return reply_error(r, shm_strerror(r)); }
+        if (r < 0) { bs_unlock(bh); return reply_error(r, mredis_strerror(r)); }
         if (r == 1) added++;
     }
 
@@ -391,7 +391,7 @@ s_replyObject *cmd_bset(ShmHandle *h, string_t *args[], uint32_t argc)
  *  §8  BGET  key score
  *  [rdlock] 복수 독자 동시 진입 가능
  * ============================================================ */
-s_replyObject *cmd_bget(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_bget(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3) return reply_error(SHM_ERR_ARGC, "usage: BGET key score");
 
@@ -425,7 +425,7 @@ s_replyObject *cmd_bget(ShmHandle *h, string_t *args[], uint32_t argc)
  *  §9  BDEL  key score [score …]
  *  [wrlock]
  * ============================================================ */
-s_replyObject *cmd_bdel(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_bdel(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3)
         return reply_error(SHM_ERR_ARGC, "usage: BDEL key score [score ...]");
@@ -462,7 +462,7 @@ s_replyObject *cmd_bdel(ShmHandle *h, string_t *args[], uint32_t argc)
  *  §10  BRANGE  key start stop
  *  [rdlock] 스냅샷 후 lock-free 탐색, 복사
  * ============================================================ */
-s_replyObject *cmd_brange(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_brange(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4)
         return reply_error(SHM_ERR_ARGC, "usage: BRANGE key start stop");
@@ -490,13 +490,13 @@ s_replyObject *cmd_brange(ShmHandle *h, string_t *args[], uint32_t argc)
 
     int64_t       need = stop - start + 1;
     s_replyObject *arr = reply_array((size_t)(need * 2));
-    if (!arr) return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+    if (!arr) return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
 
     BSetEntry *earr = (BSetEntry *)OFF2PTR(h, snap_off);
     for (int64_t i = start; i <= stop; i++) {
         if (bs_append_pair(h, arr, &earr[i]) != SHM_OK) {
             reply_free(arr);
-            return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+            return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
         }
     }
     return arr;
@@ -506,7 +506,7 @@ s_replyObject *cmd_brange(ShmHandle *h, string_t *args[], uint32_t argc)
  *  §11  BRANGEBYSCORE  key min max [LIMIT offset count]
  *  [rdlock] 스냅샷 후 lock-free 탐색
  * ============================================================ */
-s_replyObject *cmd_brangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_brangebyscore(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4)
         return reply_error(SHM_ERR_ARGC,
@@ -537,7 +537,7 @@ s_replyObject *cmd_brangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
     if (lo >= hi) return reply_array(0);
 
     s_replyObject *arr = reply_array((size_t)((hi - lo) * 2));
-    if (!arr) return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+    if (!arr) return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
 
     int64_t skipped = 0, collected = 0;
     for (uint64_t i = lo; i < hi; i++) {
@@ -545,7 +545,7 @@ s_replyObject *cmd_brangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
         if (lcnt >= 0 && collected >= lcnt) break;
         if (bs_append_pair(h, arr, &earr[i]) != SHM_OK) {
             reply_free(arr);
-            return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM));
+            return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM));
         }
         collected++;
     }
@@ -556,7 +556,7 @@ s_replyObject *cmd_brangebyscore(ShmHandle *h, string_t *args[], uint32_t argc)
  *  §12  BCARD  key
  *  [rdlock] count 단순 읽기 — 스냅샷 후 즉시 unlock
  * ============================================================ */
-s_replyObject *cmd_bcard(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_bcard(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: BCARD key");
     BSetHeader *bh = core_bset_get(h, args[1]->ptr, args[1]->len);
@@ -571,7 +571,7 @@ s_replyObject *cmd_bcard(ShmHandle *h, string_t *args[], uint32_t argc)
  *  §13  BRANK  key score
  *  [rdlock] 스냅샷 후 lock-free 이진 탐색
  * ============================================================ */
-s_replyObject *cmd_brank(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_brank(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 3) return reply_error(SHM_ERR_ARGC, "usage: BRANK key score");
 
@@ -597,7 +597,7 @@ s_replyObject *cmd_brank(ShmHandle *h, string_t *args[], uint32_t argc)
  *  §14  BCOUNT  key min max
  *  [rdlock] 스냅샷 후 lock-free 이진 탐색
  * ============================================================ */
-s_replyObject *cmd_bcount(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_bcount(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 4) return reply_error(SHM_ERR_ARGC, "usage: BCOUNT key min max");
 
@@ -623,7 +623,7 @@ s_replyObject *cmd_bcount(ShmHandle *h, string_t *args[], uint32_t argc)
  *  §15  BPOPMIN / BPOPMAX  key [count]
  *  [wrlock]
  * ============================================================ */
-static s_replyObject *bpop_impl(ShmHandle *h, string_t *args[],
+static s_replyObject *bpop_impl(MRedisHandle *h, string_t *args[],
                                  uint32_t argc, int from_min)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC,
@@ -642,7 +642,7 @@ static s_replyObject *bpop_impl(ShmHandle *h, string_t *args[],
     if (count > (int64_t)bh->count) count = (int64_t)bh->count;
 
     s_replyObject *arr = reply_array((size_t)(count * 2));
-    if (!arr) { bs_unlock(bh); return reply_error(SHM_ERR_NOMEM, shm_strerror(SHM_ERR_NOMEM)); }
+    if (!arr) { bs_unlock(bh); return reply_error(SHM_ERR_NOMEM, mredis_strerror(SHM_ERR_NOMEM)); }
 
     BSetEntry *earr = bs_arr(h, bh);
     for (int64_t i = 0; i < count; i++) {
@@ -665,21 +665,21 @@ static s_replyObject *bpop_impl(ShmHandle *h, string_t *args[],
     bs_unlock(bh);
     return arr;
 }
-s_replyObject *cmd_bpopmin(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_bpopmin(MRedisHandle *h, string_t *args[], uint32_t argc)
     { return bpop_impl(h, args, argc, 1); }
-s_replyObject *cmd_bpopmax(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_bpopmax(MRedisHandle *h, string_t *args[], uint32_t argc)
     { return bpop_impl(h, args, argc, 0); }
 
 /* ============================================================
  *  §16  BDROP  key
  *  [wrlock after bucket unlock]
  * ============================================================ */
-s_replyObject *cmd_bdrop(ShmHandle *h, string_t *args[], uint32_t argc)
+s_replyObject *cmd_bdrop(MRedisHandle *h, string_t *args[], uint32_t argc)
 {
     if (argc < 2) return reply_error(SHM_ERR_ARGC, "usage: BDROP key");
     const void *key = args[1]->ptr; uint32_t klen = args[1]->len;
 
-    uint32_t     idx = shm_hash(key, klen);
+    uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
     BucketEntry *bk  = core_get_bucket(h, idx);
     bucket_lock(h, idx);
 
@@ -687,7 +687,7 @@ s_replyObject *cmd_bdrop(ShmHandle *h, string_t *args[], uint32_t argc)
     uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_BSET, &prev);
     if (ne_off == OFFSET_NULL) {
         pthread_mutex_unlock(&bk->mutex);
-        return reply_error(SHM_ERR_NOT_FOUND, shm_strerror(SHM_ERR_NOT_FOUND));
+        return reply_error(SHM_ERR_NOT_FOUND, mredis_strerror(SHM_ERR_NOT_FOUND));
     }
     NameEntry  *ne    = (NameEntry *)OFF2PTR(h, ne_off);
     uint64_t    bh_off = ne->data_offset;
@@ -707,4 +707,43 @@ s_replyObject *cmd_bdrop(ShmHandle *h, string_t *args[], uint32_t argc)
     pthread_rwlock_destroy(&bh->rwlock);
     heap_free(h, bh_off);
     return reply_ok();
+}
+
+/* ── ENTRY_BSET drop ────────────────────────────────────────
+ *  ① bucket lock → NameEntry 제거 → bucket unlock
+ *  ② BSetHeader.mutex lock → 모든 BSetEntry value 해제 → unlock
+ *  ③ BSetHeader + 배열 힙 해제
+ * ─────────────────────────────────────────────────────────── */
+int drop_bset(MRedisHandle *h, const void *key, uint32_t klen)
+{
+    uint32_t     idx = mredis_hash(key, klen)%((MRedisHeader*)(h->base))->hash_table_size;
+    BucketEntry *bk  = core_get_bucket(h, idx);
+    bucket_lock(h, idx);
+
+    uint64_t prev   = OFFSET_NULL;
+    uint64_t ne_off = bucket_find_locked(h, bk, key, klen, ENTRY_BSET, &prev);
+    if (ne_off == OFFSET_NULL) {
+        pthread_mutex_unlock(&bk->mutex);
+        return SHM_ERR_NOT_FOUND;
+    }
+    NameEntry  *ne    = (NameEntry *)OFF2PTR(h, ne_off);
+    uint64_t    bh_off = ne->data_offset;
+    BSetHeader *bh     = (BSetHeader *)OFF2PTR(h, bh_off);
+
+    if (prev == OFFSET_NULL) bk->head_offset = ne->next_offset;
+    else ((NameEntry *)OFF2PTR(h, prev))->next_offset = ne->next_offset;
+    nameentry_free(h, ne_off);
+    pthread_mutex_unlock(&bk->mutex);
+
+    pthread_rwlock_wrlock(&bh->rwlock);
+    BSetEntry *arr = (BSetEntry *)OFF2PTR(h, bh->array_offset);
+    for (uint64_t i = 0; i < bh->count; i++)
+        heap_free(h, arr[i].offset);
+    heap_free(h, bh->array_offset);
+    pthread_rwlock_unlock(&bh->rwlock);
+    pthread_rwlock_destroy(&bh->rwlock);
+    heap_free(h, bh_off);
+
+    LOG_TRACE("DEL(BSET): '%.*s'", klen, (const char *)key);
+    return SHM_OK;
 }

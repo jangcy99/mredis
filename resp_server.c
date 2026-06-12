@@ -14,8 +14,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_pubsub.h"
 #include "cmd_dispatch.h"
 
@@ -27,7 +27,7 @@
 pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static volatile int running = 1;
-static ShmHandle *g_shm = NULL;
+static MRedisHandle *g_shm = NULL;
 static int	sigfd;
 
 static void sigint_handler(int sig) {
@@ -380,7 +380,7 @@ void fd_clear_subscribe (int sockfd)	{
 /* ============================================================
  *  명령어 처리
  * ============================================================ */
-static void process_command(pthread_mutex_t *mutex, int client_fd, ShmHandle *h, RespParser *parser)
+static void process_command(pthread_mutex_t *mutex, int client_fd, MRedisHandle *h, RespParser *parser)
 {
     string_t *args[MAX_ARGS] = {0};
     uint32_t argc = 0;
@@ -476,6 +476,7 @@ static void *client_handler(void *arg)
 int	verbose = DBG_INFO;
 int	port = DEFAULT_PORT;
 int daemonflag;
+char	*mredis_name;
 
 int	getoption (int argc, char *argv[])	{
 	int	n = 1;
@@ -492,6 +493,10 @@ int	getoption (int argc, char *argv[])	{
 				else if (strcasecmp (argv[n], "DBG_INFO") == 0)		verbose = DBG_INFO;
 				else if (strcasecmp (argv[n], "DBG_TRACE") == 0)	verbose = DBG_TRACE;
 			}
+		}
+		else if (strcasecmp (argv[n], "--name") == 0)	{
+			n ++; if (n >= argc)	return -1;
+			mredis_name = argv[n];
 		}
 		else if (strcasecmp (argv[n], "--port") == 0)	{
 			n ++; if (n >= argc)	return -1;
@@ -515,6 +520,7 @@ void	usage(char *pname)	{
  * ============================================================ */
 int main(int argc, char *argv[])
 {
+	mredis_name = SHM_DEFAULT_NAME;
 	int rc = getoption (argc, argv);
 	if (rc < 0)	{
 		usage(argv[0]);
@@ -524,16 +530,16 @@ int main(int argc, char *argv[])
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-	shm_set_debug_level(verbose);
+	mredis_set_debug_level(verbose);
     printf("==================================================================\n");
     printf("     MREDIS RESP Server (Redis Compatible) pid:%d\n", getpid());
     printf("==================================================================\n");
 
     // SHM 열기 또는 생성
-    g_shm = shm_open_existing(SHM_DEFAULT_NAME);
+    g_shm = mredis_open_existing(mredis_name);
     if (!g_shm) {
         printf("[INFO] SHM이 없어 새로 생성합니다... (1GB)\n");
-        g_shm = shm_create(SHM_DEFAULT_NAME, 1ULL << 30);  // 1GB
+        g_shm = mredis_create(mredis_name, 1ULL << 30);  // 1GB
     }
 
     if (!g_shm) {
@@ -541,7 +547,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    shm_dump_stats(g_shm);
+    mredis_dump_stats(g_shm);
 	sigfd = make_signalfd();
 	if (sigfd < 0)	return -1;
 
@@ -601,7 +607,7 @@ int main(int argc, char *argv[])
     }
 
     close(server_fd);
-    shm_close(g_shm);
+    mredis_close(g_shm);
     printf("서버 종료됨.\n");
     return 0;
 }

@@ -25,12 +25,12 @@
 #include <errno.h>
 #include <pthread.h>
 
-#include "shm_types.h"
-#include "shm_core.h"
+#include "mredis_types.h"
+#include "mredis_core.h"
 #include "cmd_pubsub.h"
 
 /* ─── 픽스처 ───────────────────────────────────────────── */
-#define SHM_NAME   "/shm_pubsub_test"
+#define SHM_NAME   "/mredis_pubsub_test"
 #define SHM_SIZE   (128ULL * 1024 * 1024)
 
 #define PASS  "\033[32m[PASS]\033[0m"
@@ -44,20 +44,20 @@ static int g_pass = 0, g_fail = 0;
 }while(0)
 
 /* ─── cmd_dispatch 없이 직접 호출하는 래퍼 ─────────────── */
-static s_replyObject *pub(ShmHandle *h, const char *ch, const char *msg)
+static s_replyObject *pub(MRedisHandle *h, const char *ch, const char *msg)
 {
     string_t a0={"PUBLISH",7}, a1={(char*)ch,(uint32_t)strlen(ch)};
     string_t a2={(char*)msg,(uint32_t)strlen(msg)};
     string_t *args[]={&a0,&a1,&a2};
     return cmd_publish(h, args, 3);
 }
-static s_replyObject *sub(ShmHandle *h, const char *ch)
+static s_replyObject *sub(MRedisHandle *h, const char *ch)
 {
     string_t a0={"SUBSCRIBE",9}, a1={(char*)ch,(uint32_t)strlen(ch)};
     string_t *args[]={&a0,&a1};
     return cmd_subscribe(h, args, 2);
 }
-static s_replyObject *unsub(ShmHandle *h, const char *ch)
+static s_replyObject *unsub(MRedisHandle *h, const char *ch)
 {
     string_t a0={"UNSUBSCRIBE",11}, a1={(char*)ch,(uint32_t)strlen(ch)};
     string_t *args[]={&a0,&a1};
@@ -75,7 +75,7 @@ static int make_signalfd(void)
 }
 
 /* ─── signalfd 에서 메시지 1개 읽기 (타임아웃 ms) ──────── */
-static s_replyObject *recv_msg(ShmHandle *h, int sfd, int timeout_ms)
+static s_replyObject *recv_msg(MRedisHandle *h, int sfd, int timeout_ms)
 {
     fd_set fds; FD_ZERO(&fds); FD_SET(sfd, &fds);
     struct timeval tv = { timeout_ms/1000, (timeout_ms%1000)*1000 };
@@ -87,7 +87,7 @@ static s_replyObject *recv_msg(ShmHandle *h, int sfd, int timeout_ms)
 /* ============================================================
  *  §01  기본 흐름
  * ============================================================ */
-static void t01_basic(ShmHandle *h)
+static void t01_basic(MRedisHandle *h)
 {
     SECT("01. 기본: SUBSCRIBE → PUBLISH → 수신");
 
@@ -118,7 +118,7 @@ static void t01_basic(ShmHandle *h)
 /* ============================================================
  *  §02  멀티채널 SUBSCRIBE
  * ============================================================ */
-static void t02_multichannel(ShmHandle *h)
+static void t02_multichannel(MRedisHandle *h)
 {
     SECT("02. 멀티채널 SUBSCRIBE");
 
@@ -148,7 +148,7 @@ static void t02_multichannel(ShmHandle *h)
 /* ============================================================
  *  §03  UNSUBSCRIBE 후 미수신
  * ============================================================ */
-static void t03_unsubscribe(ShmHandle *h)
+static void t03_unsubscribe(MRedisHandle *h)
 {
     SECT("03. UNSUBSCRIBE 후 메시지 미수신");
 
@@ -172,7 +172,7 @@ static void t03_unsubscribe(ShmHandle *h)
 /* ============================================================
  *  §04  구독자 없는 채널
  * ============================================================ */
-static void t04_no_subscriber(ShmHandle *h)
+static void t04_no_subscriber(MRedisHandle *h)
 {
     SECT("04. 구독자 없는 채널 PUBLISH");
 
@@ -186,9 +186,9 @@ static void t04_no_subscriber(ShmHandle *h)
 #define MP_SUBS   4
 #define MP_MSGS   10
 
-static void subscriber_proc(const char *shm_name, int proc_idx __attribute__((unused)))
+static void subscriber_proc(const char *mredis_name, int proc_idx __attribute__((unused)))
 {
-    ShmHandle *h = shm_open_existing(shm_name);
+    MRedisHandle *h = mredis_open_existing(mredis_name);
     if (!h) exit(1);
 
     int sfd = make_signalfd();
@@ -208,11 +208,11 @@ static void subscriber_proc(const char *shm_name, int proc_idx __attribute__((un
 
     unsub(h, "mp_ch");
     close(sfd);
-    shm_close(h);
+    mredis_close(h);
     exit(recv_cnt == MP_MSGS ? 0 : 1);
 }
 
-static void t05_multiprocess(ShmHandle *h)
+static void t05_multiprocess(MRedisHandle *h)
 {
     SECT("05. 멀티프로세스: N 구독자 × 1 발행자");
 
@@ -265,17 +265,17 @@ static void t05_multiprocess(ShmHandle *h)
  * ============================================================ */
 #define RACE_PROCS  8
 
-static void race_sub_proc(const char *shm_name)
+static void race_sub_proc(const char *mredis_name)
 {
-    ShmHandle *h = shm_open_existing(shm_name);
+    MRedisHandle *h = mredis_open_existing(mredis_name);
     if (!h) exit(1);
     s_replyObject *r = sub(h, "race_ch");
     reply_free(r);
-    shm_close(h);
+    mredis_close(h);
     exit(0);
 }
 
-static void t06_subscribe_race(ShmHandle *h)
+static void t06_subscribe_race(MRedisHandle *h)
 {
     SECT("06. 동시 SUBSCRIBE 경쟁 → pidcnt 정확성");
     pid_t pids[RACE_PROCS];
@@ -298,16 +298,16 @@ static void t06_subscribe_race(ShmHandle *h)
 /* ============================================================
  *  §07  pubsub_cleanup → 죽은 채널 해제
  * ============================================================ */
-static void t07_cleanup(ShmHandle *h)
+static void t07_cleanup(MRedisHandle *h)
 {
     SECT("07. pubsub_cleanup – 죽은 구독자 채널 해제");
 
     /* 자식이 구독 후 종료 (채널 유령) */
     pid_t pid = fork();
     if (pid == 0) {
-        ShmHandle *ch = shm_open_existing(SHM_NAME);
+        MRedisHandle *ch = mredis_open_existing(SHM_NAME);
         sub(ch, "ghost_ch");
-        shm_close(ch);
+        mredis_close(ch);
         exit(0);  /* 구독 해제 없이 종료 */
     }
     waitpid(pid, NULL, 0);
@@ -328,7 +328,7 @@ static void t07_cleanup(ShmHandle *h)
  * ============================================================ */
 #define BULK_MSGS  50
 
-static void t08_bulk_order(ShmHandle *h)
+static void t08_bulk_order(MRedisHandle *h)
 {
     SECT("08. 대량 메시지 순서 보장");
 
@@ -358,7 +358,7 @@ static void t08_bulk_order(ShmHandle *h)
 /* ============================================================
  *  §09  빈 메시지 (len=0)
  * ============================================================ */
-static void t09_empty_msg(ShmHandle *h)
+static void t09_empty_msg(MRedisHandle *h)
 {
     SECT("09. 빈 메시지(len=0) 발행/수신");
 
@@ -380,7 +380,7 @@ static void t09_empty_msg(ShmHandle *h)
 /* ============================================================
  *  §10  채널 자동 삭제 (마지막 구독자 UNSUBSCRIBE)
  * ============================================================ */
-static void t10_auto_delete(ShmHandle *h)
+static void t10_auto_delete(MRedisHandle *h)
 {
     SECT("10. 채널 자동 삭제 (마지막 구독자 UNSUBSCRIBE)");
 
@@ -407,10 +407,10 @@ int main(void)
     printf("║    Pub/Sub 멀티프로세스 통합 테스트 (10)     ║\n");
     printf("╚══════════════════════════════════════════════╝\n");
 
-    shm_destroy(SHM_NAME);
-    ShmHandle *h = shm_create(SHM_NAME, SHM_SIZE);
+    mredis_destroy(SHM_NAME);
+    MRedisHandle *h = mredis_create(SHM_NAME, SHM_SIZE);
     if (!h) { fprintf(stderr, "SHM 생성 실패\n"); return 1; }
-    shm_set_debug_level(DBG_ERROR);
+    mredis_set_debug_level(DBG_ERROR);
 
     t01_basic(h);
     t02_multichannel(h);
@@ -423,9 +423,9 @@ int main(void)
     t09_empty_msg(h);
     t10_auto_delete(h);
 
-	shm_dump_stats(h);
-    shm_close(h);
-    shm_destroy(SHM_NAME);
+	mredis_dump_stats(h);
+    mredis_close(h);
+    mredis_destroy(SHM_NAME);
 
     printf("\n══════════════════════════════════════════════\n");
     printf("결과: \033[32mPASS %d\033[0m / \033[31mFAIL %d\033[0m / 합계 %d\n",
